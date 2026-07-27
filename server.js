@@ -14,6 +14,7 @@ const STORE_FILE     = path.join(__dirname, 'signups.json');
 const TTL_MS          = 24 * 60 * 60 * 1000; // 24 hours — link + whole flow expires after this
 const PIN_LENGTH       = 5;
 const MAX_PIN_ATTEMPTS = 5; // link is invalidated after this many wrong codes
+const MAX_EMAIL_CHANGES = 3; // link is invalidated after this many "wrong email, go back" clicks
 
 // NOTE ON THIS URL: the message this was spec'd from pasted a markdown link where the
 // *visible* text was ".../webhook/getEmail" but the *actual* href was
@@ -117,7 +118,8 @@ app.post('/create-signup', (req, res) => {
     stage: 'email',            // email → pin → details → done
     email: null,
     academicOptions: null,
-    attempts: 0
+    attempts: 0,
+    emailChanges: 0
   };
   saveStore(store);
 
@@ -231,6 +233,28 @@ app.post('/signup/:id/verify', async (req, res) => {
   const remaining = MAX_PIN_ATTEMPTS - record.attempts;
   const msg = result.data?.error || result.data?.message || 'Incorrect code, try again.';
   res.json({ ok: false, error: `${msg} (${remaining} attempt${remaining === 1 ? '' : 's'} left)` });
+});
+
+// POST /signup/:id/back-to-email — lets the user correct a mistyped email from the pin
+// page. Keeps the old (wrong) email pre-filled so they can just fix the typo, and caps
+// how many times this can happen so the getEmail webhook can't be spammed indefinitely.
+app.post('/signup/:id/back-to-email', (req, res) => {
+  const store  = loadStore();
+  const record = store[req.params.id];
+  if (!requireSession(req, res, record)) return;
+  if (record.stage !== 'pin') return res.status(400).json({ ok: false, error: 'This step is not available right now.' });
+
+  record.emailChanges = (record.emailChanges || 0) + 1;
+  if (record.emailChanges > MAX_EMAIL_CHANGES) {
+    delete store[req.params.id];
+    saveStore(store);
+    return res.json({ ok: false, locked: true, error: 'Too many email changes. Please request a new signup link.' });
+  }
+
+  record.stage    = 'email';
+  record.attempts = 0;
+  saveStore(store);
+  res.json({ ok: true });
 });
 
 // POST /signup/:id/complete  { school, department, level, agreed } → finishes registration
@@ -385,7 +409,7 @@ function emailPage(id, record) {
     <div class="banner bad" id="banner"></div>
     <div class="field">
       <label for="email">Email address</label>
-      <input type="email" id="email" placeholder="you@example.com" autocomplete="email"/>
+      <input type="email" id="email" placeholder="you@example.com" autocomplete="email" value="${escapeHtml(record.email || '')}"/>
       <div class="err" id="emailErr">Please enter a valid email address.</div>
     </div>
     <button class="btn" id="submitBtn">Send verification code</button>
@@ -441,6 +465,9 @@ function pinPage(id, record) {
     <div class="pin-row">${boxes}</div>
     <div class="err" id="pinErr" style="text-align:center;margin-bottom:14px;">Please enter all ${PIN_LENGTH} digits.</div>
     <button class="btn" id="submitBtn">Verify code</button>
+    <div style="text-align:center;margin-top:16px;">
+      <a href="#" id="wrongEmailLink" style="color:var(--muted);font-size:.8rem;text-decoration:underline;">Wrong email? Go back</a>
+    </div>
     <script>
       const ID = ${idJson};
       const boxesEls = Array.from(document.querySelectorAll('.pin-box'));
@@ -488,6 +515,23 @@ function pinPage(id, record) {
         btn.disabled = false; btn.textContent = 'Verify code';
       });
       boxesEls[0].focus();
+
+      document.getElementById('wrongEmailLink').addEventListener('click', async (e) => {
+        e.preventDefault();
+        banner.classList.remove('show');
+        try {
+          const r = await fetch('/signup/' + ID + '/back-to-email', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: '{}'
+          });
+          const data = await r.json();
+          if (data.ok || data.locked) { location.reload(); return; }
+          banner.textContent = data.error || 'Something went wrong. Please try again.';
+          banner.classList.add('show');
+        } catch (err) {
+          banner.textContent = 'Network error. Please check your connection and try again.';
+          banner.classList.add('show');
+        }
+      });
     </script>`;
   return shell(body, 'ATLAS — Enter Code', tokenPersistScript(id, record.sessionToken));
 }
