@@ -57,6 +57,8 @@ function isExpired(record) {
 // whatever the record has captured so far (email/school/department/level may be null
 // if the flow never got that far) plus a status field, and a reason code on failure so
 // your n8n workflow can tell WHY it failed.
+// Reason codes: 'link_expired' | 'max_pin_attempts' | 'max_email_changes' |
+//               'max_resend_attempts' | 'superseded_by_new_link'
 async function sendFinalWebhook(record, status, reason) {
   const payload = {
     wa_id: record.wa_id,
@@ -67,7 +69,7 @@ async function sendFinalWebhook(record, status, reason) {
     level: record.level || null,
     status // 'success' | 'failed'
   };
-  if (reason) payload.reason = reason; // e.g. 'link_expired' | 'max_pin_attempts' | 'max_email_changes' | 'max_resend_attempts'
+  if (reason) payload.reason = reason;
   payload[status === 'success' ? 'submitted_at' : 'failed_at'] = new Date().toISOString();
 
   const result = await callWebhook(FINAL_URL, payload);
@@ -96,6 +98,25 @@ async function cleanup(store) {
   expiredIds.forEach(id => delete store[id]);
   saveStore(store);
   return store;
+}
+
+// Enforces "one active link per wa_id": before a new signup link is minted, any other
+// record already sitting in the store for this same wa_id that hasn't reached 'done'
+// gets killed off first — its final webhook fires with reason 'superseded_by_new_link',
+// then it's deleted. This means the moment a fresh link is issued, every older link for
+// that wa_id 404s (GET /signup/:id no longer finds the record) even if it was mid-flow.
+// 'done' records are left alone since they already completed and sent a success call.
+async function invalidateActiveByWaId(store, waId) {
+  const staleIds = Object.keys(store).filter(id => store[id].wa_id === waId && store[id].stage !== 'done');
+  if (!staleIds.length) return;
+
+  await Promise.all(staleIds.map(async id => {
+    try { await sendFinalWebhook(store[id], 'failed', 'superseded_by_new_link'); }
+    catch (e) { console.error('Supersede webhook failed:', e); }
+  }));
+
+  staleIds.forEach(id => delete store[id]);
+  saveStore(store);
 }
 
 setInterval(async () => {
@@ -147,14 +168,19 @@ async function callWebhook(url, payload) {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // POST /create-signup  { wa_id, username } → { link, id }
+// If this wa_id already has an active (non-done) link, it's invalidated first — see
+// invalidateActiveByWaId — so at most one signup link can ever be "live" per wa_id.
 app.post('/create-signup', async (req, res) => {
   const { wa_id, username } = req.body || {};
   if (!wa_id || !username) return res.status(400).json({ error: 'Missing wa_id or username' });
 
-  const id    = uuidv4();
-  const store = await cleanup(loadStore());
+  const id      = uuidv4();
+  const waIdStr = String(wa_id);
+  const store   = await cleanup(loadStore());
+  await invalidateActiveByWaId(store, waIdStr);
+
   store[id] = {
-    wa_id: String(wa_id),
+    wa_id: waIdStr,
     username: String(username),
     createdAt: Date.now(),
     expiresAt: Date.now() + TTL_MS,
@@ -400,6 +426,38 @@ const BASE_STYLE = `
     --amber:#f59e0b;--text:#e2e8f0;--muted:#64748b;--mono:'JetBrains Mono',monospace;
   }
   body{background:var(--bg);color:var(--text);font-family:'Sora',sans-serif;min-height:100vh;margin:0;overflow-x:hidden;}
+
+  /* Slow-spinning colour wash behind everything else — the "depth" layer */
+  .bg-aura{
+    position:fixed;inset:-25%;z-index:0;pointer-events:none;opacity:.7;
+    background:conic-gradient(from 0deg at 50% 50%,
+      rgba(59,130,246,.14), rgba(20,184,166,.10), rgba(124,58,237,.14),
+      rgba(59,130,246,.10), rgba(20,184,166,.12), rgba(59,130,246,.14));
+    filter:blur(90px);
+    animation:auraSpin 30s linear infinite;
+  }
+  @keyframes auraSpin{ to{ transform:rotate(360deg); } }
+
+  /* Faint drifting starfield for texture */
+  .bg-particles{
+    position:fixed;inset:-40px;z-index:0;pointer-events:none;opacity:.55;
+    background-image:
+      radial-gradient(1.6px 1.6px at 12% 22%, rgba(226,232,240,.55) 0%, transparent 60%),
+      radial-gradient(1.6px 1.6px at 68% 14%, rgba(226,232,240,.4) 0%, transparent 60%),
+      radial-gradient(1.3px 1.3px at 38% 68%, rgba(226,232,240,.45) 0%, transparent 60%),
+      radial-gradient(1.6px 1.6px at 86% 52%, rgba(226,232,240,.35) 0%, transparent 60%),
+      radial-gradient(1.3px 1.3px at 8% 82%, rgba(226,232,240,.4) 0%, transparent 60%),
+      radial-gradient(1.6px 1.6px at 55% 90%, rgba(226,232,240,.35) 0%, transparent 60%),
+      radial-gradient(1.3px 1.3px at 92% 28%, rgba(226,232,240,.45) 0%, transparent 60%),
+      radial-gradient(1.6px 1.6px at 28% 46%, rgba(226,232,240,.3) 0%, transparent 60%),
+      radial-gradient(1.3px 1.3px at 78% 78%, rgba(226,232,240,.35) 0%, transparent 60%);
+    animation:driftParticles 22s ease-in-out infinite;
+  }
+  @keyframes driftParticles{
+    0%,100%{transform:translate(0,0);}
+    50%{transform:translate(-16px,-22px);}
+  }
+
   .bg-grid{position:fixed;inset:0;z-index:0;pointer-events:none;
     background-image:linear-gradient(rgba(99,102,241,.06) 1px,transparent 1px),linear-gradient(90deg,rgba(99,102,241,.06) 1px,transparent 1px);
     background-size:44px 44px;animation:gridPulse 5s ease-in-out infinite;}
@@ -407,6 +465,7 @@ const BASE_STYLE = `
   .bg-orb{position:fixed;border-radius:50%;pointer-events:none;z-index:0;filter:blur(80px);}
   .bg-orb-1{width:520px;height:520px;top:-160px;right:-120px;background:radial-gradient(circle,rgba(99,102,241,.2) 0%,transparent 70%);animation:orbFloat 9s ease-in-out infinite;}
   .bg-orb-2{width:420px;height:420px;bottom:5%;left:-120px;background:radial-gradient(circle,rgba(20,184,166,.16) 0%,transparent 70%);animation:orbFloat 11s ease-in-out infinite reverse;}
+  .bg-orb-3{width:300px;height:300px;top:38%;left:62%;background:radial-gradient(circle,rgba(124,58,237,.16) 0%,transparent 70%);animation:orbFloat 13s ease-in-out infinite;}
   @keyframes orbFloat{0%,100%{transform:translateY(0) scale(1);}50%{transform:translateY(-32px) scale(1.05);}}
   .wrap{max-width:440px;margin:0 auto;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px 16px;position:relative;z-index:1;}
   .card{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:32px 26px;width:100%;animation:slideIn .35s cubic-bezier(.4,0,.2,1);}
@@ -464,7 +523,8 @@ function shell(bodyHtml, title, tokenScript) {
   <link rel="icon" type="image/svg+xml" href="${FAVICON}"/>
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
   <style>${BASE_STYLE}</style></head><body>
-  <div class="bg-grid"></div><div class="bg-orb bg-orb-1"></div><div class="bg-orb bg-orb-2"></div>
+  <div class="bg-aura"></div><div class="bg-particles"></div><div class="bg-grid"></div>
+  <div class="bg-orb bg-orb-1"></div><div class="bg-orb bg-orb-2"></div><div class="bg-orb bg-orb-3"></div>
   <div class="wrap"><div class="card">${bodyHtml}</div></div>
   ${tokenScript || ''}
   </body></html>`;
@@ -913,7 +973,7 @@ function expiredPage() {
   const body = `
     <div class="center-icon">⏳</div>
     <h1 style="text-align:center;">Link expired</h1>
-    <div class="sub" style="text-align:center;">This signup link is no longer valid — it may have expired, been used too many times, or already been completed.</div>
+    <div class="sub" style="text-align:center;">This signup link is no longer valid — it may have expired, been used too many times, been replaced by a newer link, or already been completed.</div>
     <div class="sub" style="text-align:center;margin-bottom:0;"><a href="${STUDY_BUDDY_CONTACT_URL}" target="_blank" rel="noopener noreferrer" style="color:var(--accent2);font-weight:600;text-decoration:underline;">Contact Study Buddy</a> on WhatsApp to start again.</div>`;
   return shell(body, 'Study Buddy — Link Expired');
 }
