@@ -156,12 +156,16 @@ async function callWebhook(url, payload) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
+    // Read as text first — this n8n webhook can respond with a plain string (e.g.
+    // "email already exist") instead of JSON. Calling r.json() directly on that would
+    // throw, get swallowed, and leave `data` null with no trace of what was said.
+    const raw = await r.text();
     let data = null;
-    try { data = await r.json(); } catch (e) { /* no/invalid JSON body */ }
-    return { reachable: true, httpOk: r.ok, status: r.status, data };
+    try { data = raw ? JSON.parse(raw) : null; } catch (e) { /* not JSON — callers fall back to `raw` */ }
+    return { reachable: true, httpOk: r.ok, status: r.status, data, raw };
   } catch (e) {
     console.error('Webhook call failed:', url, e.message);
-    return { reachable: false, httpOk: false, status: 0, data: null };
+    return { reachable: false, httpOk: false, status: 0, data: null, raw: '' };
   }
 }
 
@@ -279,14 +283,13 @@ app.post('/signup/:id/email', async (req, res) => {
   const result = await callWebhook(GET_EMAIL_URL, { wa_id: record.wa_id, username: record.username, email });
   if (!result.reachable) return res.status(502).json({ ok: false, error: 'Could not reach the verification service. Please try again.' });
 
-  // n8n may flag "already registered" a few different ways depending on how the
-  // workflow responds — check the common shapes rather than assuming one, so this
-  // never accidentally falls through to a false success.
-  const emailTaken = !!(result.data && (
-    result.data.exists === true ||
-    result.data.emailExists === true ||
-    /already\s*(exist|registered|in use|taken)/i.test(String(result.data.error || result.data.message || ''))
-  ));
+  // This webhook can respond with a plain-text body (e.g. "email already exist")
+  // rather than JSON, so the check has to look at the raw text too, not just JSON
+  // fields — otherwise a non-JSON response silently falls through as a success.
+  const responseText = String(result.data?.error || result.data?.message || result.raw || '');
+  const emailTaken = result.data?.exists === true
+    || result.data?.emailExists === true
+    || /already\s*(exist|registered|in use|taken)/i.test(responseText);
   if (emailTaken) {
     return res.status(400).json({ ok: false, error: 'That email is already registered — please enter another.' });
   }
