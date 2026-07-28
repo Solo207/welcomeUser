@@ -278,6 +278,19 @@ app.post('/signup/:id/email', async (req, res) => {
 
   const result = await callWebhook(GET_EMAIL_URL, { wa_id: record.wa_id, username: record.username, email });
   if (!result.reachable) return res.status(502).json({ ok: false, error: 'Could not reach the verification service. Please try again.' });
+
+  // n8n may flag "already registered" a few different ways depending on how the
+  // workflow responds — check the common shapes rather than assuming one, so this
+  // never accidentally falls through to a false success.
+  const emailTaken = !!(result.data && (
+    result.data.exists === true ||
+    result.data.emailExists === true ||
+    /already\s*(exist|registered|in use|taken)/i.test(String(result.data.error || result.data.message || ''))
+  ));
+  if (emailTaken) {
+    return res.status(400).json({ ok: false, error: 'That email is already registered — please enter another.' });
+  }
+
   if (!result.httpOk || result.data?.ok === false || result.data?.error) {
     return res.status(400).json({ ok: false, error: result.data?.error || result.data?.message || 'Could not send a verification code to that email. Please try again.' });
   }
