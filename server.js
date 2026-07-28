@@ -195,7 +195,8 @@ app.post('/create-signup', async (req, res) => {
     academicOptions: null,
     attempts: 0,
     emailChanges: 0,
-    resendCount: 0
+    resendCount: 0,
+    lastCodeSentAt: null       // set whenever a code actually goes out — drives the resend cooldown
   };
   saveStore(store);
 
@@ -298,10 +299,11 @@ app.post('/signup/:id/email', async (req, res) => {
     return res.status(400).json({ ok: false, error: result.data?.error || result.data?.message || 'Could not send a verification code to that email. Please try again.' });
   }
 
-  record.email       = email;
-  record.stage       = 'pin';
-  record.attempts    = 0;
-  record.resendCount = 0;
+  record.email          = email;
+  record.stage          = 'pin';
+  record.attempts       = 0;
+  record.resendCount    = 0;
+  record.lastCodeSentAt = Date.now();
   saveStore(store);
   res.json({ ok: true });
 });
@@ -328,9 +330,10 @@ app.post('/signup/:id/resend', async (req, res) => {
     return res.status(502).json({ ok: false, error: 'Could not resend the code. Please try again.' });
   }
 
-  record.attempts = 0; // fresh code, fresh attempt count
+  record.attempts       = 0; // fresh code, fresh attempt count
+  record.lastCodeSentAt = Date.now();
   saveStore(store);
-  res.json({ ok: true, remaining: MAX_RESEND - record.resendCount });
+  res.json({ ok: true, remaining: MAX_RESEND - record.resendCount, resendReadyAt: record.lastCodeSentAt + RESEND_COOLDOWN_SECONDS * 1000 });
 });
 
 // POST /signup/:id/verify  { code } → checks pin via n8n, advances to 'details'
@@ -683,6 +686,11 @@ function pinPage(id, record) {
   const idJson = safeJson(id);
   const boxes = Array.from({ length: PIN_LENGTH }, (_, i) =>
     `<input class="pin-box" maxlength="1" inputmode="numeric" pattern="[0-9]*" data-i="${i}"/>`).join('');
+  // Real timestamp of when the last code went out, so the cooldown on the resend button
+  // reflects actual elapsed time — not a fresh RESEND_COOLDOWN_SECONDS every time this
+  // page happens to reload. Falls back to "now" only for the (shouldn't-happen) case of
+  // a missing timestamp, which just means the button starts disabled for a full cooldown.
+  const resendReadyAt = (record.lastCodeSentAt || Date.now()) + RESEND_COOLDOWN_SECONDS * 1000;
   const body = `
     <div class="expiry-timer" id="expiryTimer"></div>
     <div class="eyebrow">Study Buddy Registration</div>
@@ -700,6 +708,7 @@ function pinPage(id, record) {
     <script>
       const ID = ${idJson};
       const RESEND_SECONDS = ${RESEND_COOLDOWN_SECONDS};
+      let RESEND_READY_AT = ${resendReadyAt};
       const boxesEls = Array.from(document.querySelectorAll('.pin-box'));
       const pinErr     = document.getElementById('pinErr');
       const banner     = document.getElementById('banner');
@@ -810,20 +819,31 @@ function pinPage(id, record) {
       });
 
       let resendCooldown = 0;
+      let cooldownInterval = null;
       function startResendCooldown(seconds) {
+        clearInterval(cooldownInterval);
         resendCooldown = seconds;
         resendBtn.disabled = true;
         resendBtn.textContent = 'Resend code (' + resendCooldown + 's)';
-        const iv = setInterval(() => {
+        cooldownInterval = setInterval(() => {
           resendCooldown--;
           if (resendCooldown <= 0) {
-            clearInterval(iv);
+            clearInterval(cooldownInterval);
             resendBtn.disabled = false;
             resendBtn.textContent = 'Resend code';
           } else {
             resendBtn.textContent = 'Resend code (' + resendCooldown + 's)';
           }
         }, 1000);
+      }
+
+      // Derives the cooldown from RESEND_READY_AT (a real server timestamp) rather than
+      // always restarting a fresh RESEND_SECONDS countdown — so a page refresh shows the
+      // true time remaining instead of resetting the wait every time.
+      function syncResendCooldown() {
+        const remaining = Math.ceil((RESEND_READY_AT - Date.now()) / 1000);
+        if (remaining > 0) startResendCooldown(remaining);
+        else { clearInterval(cooldownInterval); resendBtn.disabled = false; resendBtn.textContent = 'Resend code'; }
       }
 
       async function attemptResend() {
@@ -838,7 +858,8 @@ function pinPage(id, record) {
             showBanner('A new code has been sent to your email.', true);
             boxesEls.forEach(b => b.value = '');
             boxesEls[0].focus();
-            startResendCooldown(RESEND_SECONDS);
+            RESEND_READY_AT = data.resendReadyAt || (Date.now() + RESEND_SECONDS * 1000);
+            syncResendCooldown();
             return;
           }
           showBanner(data.error || 'Could not resend the code.', false);
@@ -852,7 +873,7 @@ function pinPage(id, record) {
         banner.classList.remove('show');
         attemptResend();
       });
-      startResendCooldown(RESEND_SECONDS); // a code was just sent to get here — start the cooldown immediately
+      syncResendCooldown(); // reflect the real time left, not a fresh cooldown on every reload
     </script>`;
   return shell(body, 'Study Buddy — Enter Code', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
 }
