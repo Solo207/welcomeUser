@@ -11,10 +11,15 @@ app.use(cookieParser());
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const STORE_FILE     = path.join(__dirname, 'signups.json');
-const TTL_MS          = 24 * 60 * 60 * 1000; // 24 hours — link + whole flow expires after this
+const TTL_MS          = 2 * 60 * 60 * 1000; // 2 hours — link + whole flow expires after this
 const PIN_LENGTH       = 5;
-const MAX_PIN_ATTEMPTS = 5; // link is invalidated after this many wrong codes
+const MAX_PIN_ATTEMPTS = 3; // link is invalidated after this many wrong codes
 const MAX_EMAIL_CHANGES = 3; // link is invalidated after this many "wrong email, go back" clicks
+const MAX_RESEND        = 3; // link is invalidated after this many "resend code" taps
+const RESEND_COOLDOWN_SECONDS = 60; // how long the resend button stays disabled after each send
+
+const ADMIN_CONTACT_URL = 'https://wa.me/2348138450036?text=Hello%2C%20I%20need%20your%20help';
+const STUDY_BUDDY_CONTACT_URL = 'https://wa.me/2349136086344?text=Hello';
 
 // NOTE ON THIS URL: the message this was spec'd from pasted a markdown link where the
 // *visible* text was ".../webhook/getEmail" but the *actual* href was
@@ -44,22 +49,62 @@ function saveStore(store) {
   }).catch(err => console.error('saveStore error:', err));
 }
 
-function cleanup(store) {
-  const now = Date.now(); let changed = false;
-  for (const id in store) {
-    if (now > store[id].expiresAt) { delete store[id]; changed = true; }
+function isExpired(record) {
+  return Date.now() > record.expiresAt;
+}
+
+// Builds and sends the final-webhook payload for either outcome. Always includes
+// whatever the record has captured so far (email/school/department/level may be null
+// if the flow never got that far) plus a status field, and a reason code on failure so
+// your n8n workflow can tell WHY it failed.
+async function sendFinalWebhook(record, status, reason) {
+  const payload = {
+    wa_id: record.wa_id,
+    username: record.username,
+    email: record.email || null,
+    school: record.school || null,
+    department: record.department || null,
+    level: record.level || null,
+    status // 'success' | 'failed'
+  };
+  if (reason) payload.reason = reason; // e.g. 'link_expired' | 'max_pin_attempts' | 'max_email_changes' | 'max_resend_attempts'
+  payload[status === 'success' ? 'submitted_at' : 'failed_at'] = new Date().toISOString();
+
+  const result = await callWebhook(FINAL_URL, payload);
+  if (!result.reachable || !result.httpOk) {
+    console.error(`Final webhook (status=${status}${reason ? ', reason=' + reason : ''}) did not succeed:`, result.status);
   }
-  if (changed) saveStore(store);
+  return result;
+}
+
+// Every case scenario ends with the final webhook being called exactly once — this
+// covers the "abandoned link" case: nobody clicked anything, it just timed out.
+// stage 'done' records are skipped since they already sent a success call.
+async function cleanup(store) {
+  const now = Date.now();
+  const expiredIds = Object.keys(store).filter(id => now > store[id].expiresAt);
+  if (!expiredIds.length) return store;
+
+  await Promise.all(expiredIds.map(async id => {
+    const record = store[id];
+    if (record.stage !== 'done') {
+      try { await sendFinalWebhook(record, 'failed', 'link_expired'); }
+      catch (e) { console.error('Expiry webhook failed:', e); }
+    }
+  }));
+
+  expiredIds.forEach(id => delete store[id]);
+  saveStore(store);
   return store;
 }
 
-setInterval(() => {
+setInterval(async () => {
   const store = loadStore();
   const before = Object.keys(store).length;
-  cleanup(store);
-  const after = Object.keys(store).length;
-  if (before !== after) console.log(`Periodic cleanup: removed ${before - after} expired signup(s)`);
-}, 30 * 60 * 1000);
+  const after = await cleanup(store);
+  const afterCount = Object.keys(after).length;
+  if (before !== afterCount) console.log(`Periodic cleanup: removed ${before - afterCount} expired signup(s)`);
+}, 5 * 60 * 1000);
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
 function setSessionCookie(res, id, token) {
@@ -102,12 +147,12 @@ async function callWebhook(url, payload) {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // POST /create-signup  { wa_id, username } → { link, id }
-app.post('/create-signup', (req, res) => {
+app.post('/create-signup', async (req, res) => {
   const { wa_id, username } = req.body || {};
   if (!wa_id || !username) return res.status(400).json({ error: 'Missing wa_id or username' });
 
   const id    = uuidv4();
-  const store = cleanup(loadStore());
+  const store = await cleanup(loadStore());
   store[id] = {
     wa_id: String(wa_id),
     username: String(username),
@@ -119,21 +164,22 @@ app.post('/create-signup', (req, res) => {
     email: null,
     academicOptions: null,
     attempts: 0,
-    emailChanges: 0
+    emailChanges: 0,
+    resendCount: 0
   };
   saveStore(store);
 
   const host     = req.headers['x-forwarded-host'] || req.headers.host;
   const protocol = req.headers['x-forwarded-proto'] || 'http';
-  res.json({ link: `${protocol}://${host}/signup/${id}`, id, expiresIn: '24 hours' });
+  res.json({ link: `${protocol}://${host}/signup/${id}`, id, expiresIn: '2 hours' });
 });
 
 // GET /signup/:id — serves whichever stage the record is actually on server-side.
 // This is what makes it impossible to reach the pin page (or beyond) without a real,
 // server-confirmed email step: the HTML for a later stage is never generated or sent
 // until this record's `stage` field has actually advanced.
-app.get('/signup/:id', (req, res) => {
-  const store  = cleanup(loadStore());
+app.get('/signup/:id', async (req, res) => {
+  const store  = await cleanup(loadStore());
   const record = store[req.params.id];
   if (!record) return res.status(404).send(expiredPage());
 
@@ -167,21 +213,39 @@ app.post('/signup/:id/recover', (req, res) => {
   res.json({ ok: true });
 });
 
-function requireSession(req, res, record) {
+// Shared guard for every stage-gated POST route: checks the record exists, the session
+// cookie matches, the link hasn't expired (firing the failed final-webhook if it has),
+// and — if a stage is required — that the record is actually on that stage. Returns
+// {store, record} on success, or null after already sending the appropriate response.
+async function loadGuardedRecord(req, res, expectedStage) {
+  const store  = loadStore();
+  const record = store[req.params.id];
   const cookieName = 'ssess_' + req.params.id;
-  if (!record || req.cookies?.[cookieName] !== record.sessionToken) {
-    res.status(403).json({ ok: false, error: 'Unauthorized' });
-    return false;
+
+  if (!record) { res.status(404).json({ ok: false, error: 'Signup link not found.' }); return null; }
+  if (req.cookies?.[cookieName] !== record.sessionToken) { res.status(403).json({ ok: false, error: 'Unauthorized' }); return null; }
+
+  if (isExpired(record)) {
+    await sendFinalWebhook(record, 'failed', 'link_expired');
+    delete store[req.params.id];
+    saveStore(store);
+    res.status(410).json({ ok: false, locked: true, error: 'This link has expired. Contact Study Buddy on WhatsApp to start again.' });
+    return null;
   }
-  return true;
+
+  if (expectedStage && record.stage !== expectedStage) {
+    res.status(400).json({ ok: false, error: 'This step is not available right now.' });
+    return null;
+  }
+
+  return { store, record };
 }
 
 // POST /signup/:id/email  { email } → sends verification code via n8n, advances to 'pin'
 app.post('/signup/:id/email', async (req, res) => {
-  const store  = loadStore();
-  const record = store[req.params.id];
-  if (!requireSession(req, res, record)) return;
-  if (record.stage !== 'email') return res.status(400).json({ ok: false, error: 'This step is already complete.' });
+  const ctx = await loadGuardedRecord(req, res, 'email');
+  if (!ctx) return;
+  const { store, record } = ctx;
 
   const email = (req.body?.email || '').trim();
   if (!isValidEmail(email)) return res.status(400).json({ ok: false, error: 'Please enter a valid email address.' });
@@ -192,19 +256,46 @@ app.post('/signup/:id/email', async (req, res) => {
     return res.status(400).json({ ok: false, error: result.data?.error || result.data?.message || 'Could not send a verification code to that email. Please try again.' });
   }
 
-  record.email  = email;
-  record.stage  = 'pin';
-  record.attempts = 0;
+  record.email       = email;
+  record.stage       = 'pin';
+  record.attempts    = 0;
+  record.resendCount = 0;
   saveStore(store);
   res.json({ ok: true });
 });
 
+// POST /signup/:id/resend — resends the code via the same getEmail webhook, capped at
+// MAX_RESEND uses. A network/webhook failure doesn't burn an attempt.
+app.post('/signup/:id/resend', async (req, res) => {
+  const ctx = await loadGuardedRecord(req, res, 'pin');
+  if (!ctx) return;
+  const { store, record } = ctx;
+
+  record.resendCount = (record.resendCount || 0) + 1;
+  if (record.resendCount > MAX_RESEND) {
+    await sendFinalWebhook(record, 'failed', 'max_resend_attempts');
+    delete store[req.params.id];
+    saveStore(store);
+    return res.json({ ok: false, locked: true, error: 'Too many resend attempts. Contact Study Buddy on WhatsApp to start again.' });
+  }
+
+  const result = await callWebhook(GET_EMAIL_URL, { wa_id: record.wa_id, username: record.username, email: record.email });
+  if (!result.reachable || !result.httpOk || result.data?.ok === false || result.data?.error) {
+    record.resendCount -= 1; // don't charge an attempt if it didn't actually go out
+    saveStore(store);
+    return res.status(502).json({ ok: false, error: 'Could not resend the code. Please try again.' });
+  }
+
+  record.attempts = 0; // fresh code, fresh attempt count
+  saveStore(store);
+  res.json({ ok: true, remaining: MAX_RESEND - record.resendCount });
+});
+
 // POST /signup/:id/verify  { code } → checks pin via n8n, advances to 'details'
 app.post('/signup/:id/verify', async (req, res) => {
-  const store  = loadStore();
-  const record = store[req.params.id];
-  if (!requireSession(req, res, record)) return;
-  if (record.stage !== 'pin') return res.status(400).json({ ok: false, error: 'This step is not available right now.' });
+  const ctx = await loadGuardedRecord(req, res, 'pin');
+  if (!ctx) return;
+  const { store, record } = ctx;
 
   const code = String(req.body?.code || '').trim();
   if (!isValidPin(code)) return res.status(400).json({ ok: false, error: `Please enter the ${PIN_LENGTH}-digit code.` });
@@ -225,9 +316,10 @@ app.post('/signup/:id/verify', async (req, res) => {
   // Anything else (including the documented "incorrect code, try again" shape) is a failure.
   record.attempts = (record.attempts || 0) + 1;
   if (record.attempts >= MAX_PIN_ATTEMPTS) {
+    await sendFinalWebhook(record, 'failed', 'max_pin_attempts');
     delete store[req.params.id];
     saveStore(store);
-    return res.json({ ok: false, locked: true, error: 'Too many incorrect attempts. Please request a new signup link.' });
+    return res.json({ ok: false, locked: true, error: 'Too many incorrect attempts. Contact Study Buddy on WhatsApp to start again.' });
   }
   saveStore(store);
   const remaining = MAX_PIN_ATTEMPTS - record.attempts;
@@ -238,17 +330,17 @@ app.post('/signup/:id/verify', async (req, res) => {
 // POST /signup/:id/back-to-email — lets the user correct a mistyped email from the pin
 // page. Keeps the old (wrong) email pre-filled so they can just fix the typo, and caps
 // how many times this can happen so the getEmail webhook can't be spammed indefinitely.
-app.post('/signup/:id/back-to-email', (req, res) => {
-  const store  = loadStore();
-  const record = store[req.params.id];
-  if (!requireSession(req, res, record)) return;
-  if (record.stage !== 'pin') return res.status(400).json({ ok: false, error: 'This step is not available right now.' });
+app.post('/signup/:id/back-to-email', async (req, res) => {
+  const ctx = await loadGuardedRecord(req, res, 'pin');
+  if (!ctx) return;
+  const { store, record } = ctx;
 
   record.emailChanges = (record.emailChanges || 0) + 1;
   if (record.emailChanges > MAX_EMAIL_CHANGES) {
+    await sendFinalWebhook(record, 'failed', 'max_email_changes');
     delete store[req.params.id];
     saveStore(store);
-    return res.json({ ok: false, locked: true, error: 'Too many email changes. Please request a new signup link.' });
+    return res.json({ ok: false, locked: true, error: 'Too many email changes. Contact Study Buddy on WhatsApp to start again.' });
   }
 
   record.stage    = 'email';
@@ -259,10 +351,9 @@ app.post('/signup/:id/back-to-email', (req, res) => {
 
 // POST /signup/:id/complete  { school, department, level, agreed } → finishes registration
 app.post('/signup/:id/complete', async (req, res) => {
-  const store  = loadStore();
-  const record = store[req.params.id];
-  if (!requireSession(req, res, record)) return;
-  if (record.stage !== 'details') return res.status(400).json({ ok: false, error: 'This step is not available right now.' });
+  const ctx = await loadGuardedRecord(req, res, 'details');
+  if (!ctx) return;
+  const { store, record } = ctx;
 
   const { school, department, level, agreed } = req.body || {};
   if (!school || !department || !level) return res.status(400).json({ ok: false, error: 'Please fill in school, department, and level.' });
@@ -277,6 +368,7 @@ app.post('/signup/:id/complete', async (req, res) => {
     email: record.email,
     school, department, level,
     agreed_terms: true,
+    status: 'success',
     submitted_at: new Date().toISOString()
   };
 
@@ -292,7 +384,7 @@ app.post('/signup/:id/complete', async (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'Signup App' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'Study Buddy Signup' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Signup app running on port ${PORT}`));
@@ -354,6 +446,14 @@ const BASE_STYLE = `
   .checkbox-row label{margin:0;font-size:.82rem;color:var(--muted);line-height:1.5;}
   .checkbox-row a{color:var(--accent2);text-decoration:underline;}
   .center-icon{font-size:2.4rem;text-align:center;margin-bottom:14px;}
+  .expiry-timer{font-family:var(--mono);font-size:.7rem;color:var(--muted);text-align:right;margin-bottom:14px;}
+  .expiry-timer.warn{color:var(--amber);}
+  .expiry-timer.danger{color:var(--bad);}
+  .resend-row{text-align:center;margin-top:16px;}
+  .resend-btn{background:none;border:none;color:var(--accent2);font-family:'Sora',sans-serif;font-size:.82rem;cursor:pointer;text-decoration:underline;}
+  .resend-btn:disabled{color:var(--muted);cursor:default;text-decoration:none;}
+  .helper-note{font-size:.74rem;color:var(--muted);line-height:1.5;margin:-8px 0 18px;}
+  .helper-note a{color:var(--accent2);text-decoration:underline;}
   @media(max-width:380px){.card{padding:26px 18px;}}
 `;
 
@@ -377,6 +477,30 @@ function tokenPersistScript(id, sessionToken) {
   return `<script>try{localStorage.setItem('st_' + ${safeJson(id)}, ${safeJson(sessionToken)});}catch(e){}</script>`;
 }
 
+// Live "link expires in …" countdown shown on every active stage page. Reloads the
+// page when it hits zero so the server can serve the (now-expired) state — cleanup()
+// on that GET is what actually fires the failed final-webhook.
+function expiryTimerScript(expiresAt) {
+  return `<script>
+    (function(){
+      var expiresAt = ${expiresAt};
+      var el = document.getElementById('expiryTimer');
+      if (!el) return;
+      function tick(){
+        var msLeft = expiresAt - Date.now();
+        if (msLeft <= 0) { location.reload(); return; }
+        var totalSec = Math.floor(msLeft / 1000);
+        var h = Math.floor(totalSec / 3600), m = Math.floor((totalSec % 3600) / 60), s = totalSec % 60;
+        var pad = function(n){ return String(n).padStart(2, '0'); };
+        el.textContent = 'Link expires in ' + (h > 0 ? h + ':' + pad(m) : m) + ':' + pad(s);
+        el.className = 'expiry-timer' + (msLeft < 5*60*1000 ? ' danger' : (msLeft < 15*60*1000 ? ' warn' : ''));
+      }
+      tick();
+      setInterval(tick, 1000);
+    })();
+  </script>`;
+}
+
 function stepDots(active) {
   const labels = ['email','pin','details'];
   return `<div class="steps">${labels.map((l,i) => {
@@ -398,7 +522,8 @@ function emailPage(id, record) {
   const idJson       = safeJson(id);
   const identityLabel = `${record.username} • ${record.wa_id}`;
   const body = `
-    <div class="eyebrow">ATLAS Registration</div>
+    <div class="expiry-timer" id="expiryTimer"></div>
+    <div class="eyebrow">Study Buddy Registration</div>
     <h1>Let's verify your email</h1>
     ${stepDots('email')}
     <div class="sub">Confirm it's you, then enter the email you'd like linked to your account.</div>
@@ -428,9 +553,28 @@ function emailPage(id, record) {
       }
       emailInput.addEventListener('blur', () => validate(true));
       emailInput.addEventListener('input', () => { if (emailErr.classList.contains('show')) validate(true); });
-      btn.addEventListener('click', async () => {
-        banner.classList.remove('show');
-        if (!validate(true)) { emailInput.focus(); return; }
+
+      // If a submit fails purely due to a dropped connection (not a real error response),
+      // wait for the browser to report it's back online (or 8s, whichever first) and retry
+      // automatically — no need for the user to tap the button again.
+      function retryOnReconnect(attemptFn, bannerEl) {
+        bannerEl.classList.remove('good'); bannerEl.classList.add('bad');
+        bannerEl.textContent = "No connection — we'll retry automatically once you're back online.";
+        bannerEl.classList.add('show');
+        let fired = false, timer;
+        function retryNow() {
+          if (fired) return;
+          fired = true;
+          window.removeEventListener('online', retryNow);
+          clearTimeout(timer);
+          bannerEl.textContent = 'Reconnected — retrying…';
+          attemptFn();
+        }
+        window.addEventListener('online', retryNow);
+        timer = setTimeout(retryNow, 8000);
+      }
+
+      async function attemptSendEmail() {
         btn.disabled = true; btn.textContent = 'Sending…';
         try {
           const r = await fetch('/signup/' + ID + '/email', {
@@ -439,16 +583,23 @@ function emailPage(id, record) {
           });
           const data = await r.json();
           if (data.ok) { location.reload(); return; }
+          banner.classList.remove('good'); banner.classList.add('bad');
           banner.textContent = data.error || 'Something went wrong. Please try again.';
           banner.classList.add('show');
+          if (data.locked) { btn.disabled = true; setTimeout(() => location.reload(), 1800); return; }
+          btn.disabled = false; btn.textContent = 'Send verification code';
         } catch (e) {
-          banner.textContent = 'Network error. Please check your connection and try again.';
-          banner.classList.add('show');
+          retryOnReconnect(attemptSendEmail, banner);
         }
-        btn.disabled = false; btn.textContent = 'Send verification code';
+      }
+
+      btn.addEventListener('click', () => {
+        banner.classList.remove('show');
+        if (!validate(true)) { emailInput.focus(); return; }
+        attemptSendEmail();
       });
     </script>`;
-  return shell(body, 'ATLAS — Verify Email', tokenPersistScript(id, record.sessionToken));
+  return shell(body, 'Study Buddy — Verify Email', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
 }
 
 // ── Stage 2: pin ──────────────────────────────────────────────────────────────
@@ -457,7 +608,8 @@ function pinPage(id, record) {
   const boxes = Array.from({ length: PIN_LENGTH }, (_, i) =>
     `<input class="pin-box" maxlength="1" inputmode="numeric" pattern="[0-9]*" data-i="${i}"/>`).join('');
   const body = `
-    <div class="eyebrow">ATLAS Registration</div>
+    <div class="expiry-timer" id="expiryTimer"></div>
+    <div class="eyebrow">Study Buddy Registration</div>
     <h1>Enter your code</h1>
     ${stepDots('pin')}
     <div class="sub">We sent a ${PIN_LENGTH}-digit code to <strong>${escapeHtml(record.email)}</strong>.</div>
@@ -465,15 +617,57 @@ function pinPage(id, record) {
     <div class="pin-row">${boxes}</div>
     <div class="err" id="pinErr" style="text-align:center;margin-bottom:14px;">Please enter all ${PIN_LENGTH} digits.</div>
     <button class="btn" id="submitBtn">Verify code</button>
-    <div style="text-align:center;margin-top:16px;">
+    <div class="resend-row"><button type="button" class="resend-btn" id="resendBtn" disabled>Resend code</button></div>
+    <div style="text-align:center;margin-top:10px;">
       <a href="#" id="wrongEmailLink" style="color:var(--muted);font-size:.8rem;text-decoration:underline;">Wrong email? Go back</a>
     </div>
     <script>
       const ID = ${idJson};
+      const RESEND_SECONDS = ${RESEND_COOLDOWN_SECONDS};
       const boxesEls = Array.from(document.querySelectorAll('.pin-box'));
-      const pinErr   = document.getElementById('pinErr');
-      const banner   = document.getElementById('banner');
-      const btn      = document.getElementById('submitBtn');
+      const pinErr     = document.getElementById('pinErr');
+      const banner     = document.getElementById('banner');
+      const btn        = document.getElementById('submitBtn');
+      const resendBtn  = document.getElementById('resendBtn');
+      const wrongEmailLink = document.getElementById('wrongEmailLink');
+
+      function disableEverything() {
+        boxesEls.forEach(b => b.disabled = true);
+        btn.disabled = true;
+        resendBtn.disabled = true;
+        wrongEmailLink.style.pointerEvents = 'none';
+        wrongEmailLink.style.opacity = '.4';
+      }
+      function showBanner(msg, good) {
+        banner.textContent = msg;
+        banner.classList.toggle('good', !!good);
+        banner.classList.toggle('bad', !good);
+        banner.classList.add('show');
+      }
+      function lockedOut(msg) {
+        showBanner(msg, false);
+        disableEverything();
+        setTimeout(() => location.reload(), 1800);
+      }
+
+      // If a submit fails purely due to a dropped connection (not a real error response),
+      // wait for the browser to report it's back online (or 8s, whichever first) and retry
+      // automatically — no need for the user to tap the button again.
+      function retryOnReconnect(attemptFn) {
+        showBanner("No connection — we'll retry automatically once you're back online.", false);
+        let fired = false, timer;
+        function retryNow() {
+          if (fired) return;
+          fired = true;
+          window.removeEventListener('online', retryNow);
+          clearTimeout(timer);
+          showBanner('Reconnected — retrying…', false);
+          attemptFn();
+        }
+        window.addEventListener('online', retryNow);
+        timer = setTimeout(retryNow, 8000);
+      }
+
       boxesEls.forEach((el, i) => {
         el.addEventListener('input', () => {
           el.value = el.value.replace(/[^0-9]/g, '').slice(0, 1);
@@ -490,59 +684,110 @@ function pinPage(id, record) {
         });
       });
       function currentCode() { return boxesEls.map(b => b.value).join(''); }
-      btn.addEventListener('click', async () => {
-        banner.classList.remove('show');
-        const code = currentCode();
-        if (code.length !== ${PIN_LENGTH}) { pinErr.classList.add('show'); return; }
-        pinErr.classList.remove('show');
+
+      async function attemptVerify() {
         btn.disabled = true; btn.textContent = 'Verifying…';
         try {
           const r = await fetch('/signup/' + ID + '/verify', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin',
-            body: JSON.stringify({ code })
+            body: JSON.stringify({ code: currentCode() })
           });
           const data = await r.json();
           if (data.ok) { location.reload(); return; }
-          banner.textContent = data.error || 'Incorrect code, try again.';
-          banner.classList.add('show');
-          if (data.locked) { location.reload(); return; }
+          if (data.locked) { lockedOut(data.error || 'Too many incorrect attempts.'); return; }
+          showBanner(data.error || 'Incorrect code, try again.', false);
           boxesEls.forEach(b => b.value = '');
           boxesEls[0].focus();
+          btn.disabled = false; btn.textContent = 'Verify code';
         } catch (e) {
-          banner.textContent = 'Network error. Please check your connection and try again.';
-          banner.classList.add('show');
+          retryOnReconnect(attemptVerify);
         }
-        btn.disabled = false; btn.textContent = 'Verify code';
+      }
+
+      btn.addEventListener('click', () => {
+        banner.classList.remove('show');
+        const code = currentCode();
+        if (code.length !== ${PIN_LENGTH}) { pinErr.classList.add('show'); return; }
+        pinErr.classList.remove('show');
+        attemptVerify();
       });
       boxesEls[0].focus();
 
-      document.getElementById('wrongEmailLink').addEventListener('click', async (e) => {
-        e.preventDefault();
-        banner.classList.remove('show');
+      async function attemptBackToEmail() {
         try {
           const r = await fetch('/signup/' + ID + '/back-to-email', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: '{}'
           });
           const data = await r.json();
-          if (data.ok || data.locked) { location.reload(); return; }
-          banner.textContent = data.error || 'Something went wrong. Please try again.';
-          banner.classList.add('show');
+          if (data.locked) { lockedOut(data.error); return; }
+          if (data.ok) { location.reload(); return; }
+          showBanner(data.error || 'Something went wrong. Please try again.', false);
         } catch (err) {
-          banner.textContent = 'Network error. Please check your connection and try again.';
-          banner.classList.add('show');
+          retryOnReconnect(attemptBackToEmail);
         }
+      }
+
+      wrongEmailLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        banner.classList.remove('show');
+        attemptBackToEmail();
       });
+
+      let resendCooldown = 0;
+      function startResendCooldown(seconds) {
+        resendCooldown = seconds;
+        resendBtn.disabled = true;
+        resendBtn.textContent = 'Resend code (' + resendCooldown + 's)';
+        const iv = setInterval(() => {
+          resendCooldown--;
+          if (resendCooldown <= 0) {
+            clearInterval(iv);
+            resendBtn.disabled = false;
+            resendBtn.textContent = 'Resend code';
+          } else {
+            resendBtn.textContent = 'Resend code (' + resendCooldown + 's)';
+          }
+        }, 1000);
+      }
+
+      async function attemptResend() {
+        resendBtn.disabled = true;
+        try {
+          const r = await fetch('/signup/' + ID + '/resend', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: '{}'
+          });
+          const data = await r.json();
+          if (data.locked) { lockedOut(data.error); return; }
+          if (data.ok) {
+            showBanner('A new code has been sent to your email.', true);
+            boxesEls.forEach(b => b.value = '');
+            boxesEls[0].focus();
+            startResendCooldown(RESEND_SECONDS);
+            return;
+          }
+          showBanner(data.error || 'Could not resend the code.', false);
+          resendBtn.disabled = false;
+        } catch (e) {
+          retryOnReconnect(attemptResend);
+        }
+      }
+
+      resendBtn.addEventListener('click', () => {
+        banner.classList.remove('show');
+        attemptResend();
+      });
+      startResendCooldown(RESEND_SECONDS); // a code was just sent to get here — start the cooldown immediately
     </script>`;
-  return shell(body, 'ATLAS — Enter Code', tokenPersistScript(id, record.sessionToken));
+  return shell(body, 'Study Buddy — Enter Code', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
 }
 
 // ── Stage 3: details ──────────────────────────────────────────────────────────
 function detailsPage(id, record) {
   const idJson      = safeJson(id);
   const optionsJson = safeJson(record.academicOptions);
-  const termsUrlJson = safeJson(TERMS_URL);
   const body = `
-    <div class="eyebrow">ATLAS Registration</div>
+    <div class="expiry-timer" id="expiryTimer"></div>
+    <div class="eyebrow">Study Buddy Registration</div>
     <h1>Almost done</h1>
     ${stepDots('details')}
     <div class="sub">Tell us where you study.</div>
@@ -559,6 +804,7 @@ function detailsPage(id, record) {
       <label for="level">Level</label>
       <select id="level" disabled><option value="">Select level</option></select>
     </div>
+    <div class="helper-note">Can't find your school, department, or level? <a href="${ADMIN_CONTACT_URL}" target="_blank" rel="noopener noreferrer">Contact the admin</a>.</div>
     <div class="checkbox-row">
       <input type="checkbox" id="agree"/>
       <label for="agree">I agree to the <a href="${TERMS_URL}" target="_blank" rel="noopener noreferrer">Terms and Conditions</a>.</label>
@@ -604,8 +850,27 @@ function detailsPage(id, record) {
       levelSel.addEventListener('change', checkValid);
       agreeBox.addEventListener('change', checkValid);
 
-      btn.addEventListener('click', async () => {
-        banner.classList.remove('show');
+      // If a submit fails purely due to a dropped connection (not a real error response),
+      // wait for the browser to report it's back online (or 8s, whichever first) and retry
+      // automatically — no need for the user to tap the button again.
+      function retryOnReconnect(attemptFn) {
+        banner.classList.remove('good'); banner.classList.add('bad');
+        banner.textContent = "No connection — we'll retry automatically once you're back online.";
+        banner.classList.add('show');
+        let fired = false, timer;
+        function retryNow() {
+          if (fired) return;
+          fired = true;
+          window.removeEventListener('online', retryNow);
+          clearTimeout(timer);
+          banner.textContent = 'Reconnected — retrying…';
+          attemptFn();
+        }
+        window.addEventListener('online', retryNow);
+        timer = setTimeout(retryNow, 8000);
+      }
+
+      async function attemptComplete() {
         btn.disabled = true; btn.textContent = 'Submitting…';
         try {
           const r = await fetch('/signup/' + ID + '/complete', {
@@ -614,17 +879,23 @@ function detailsPage(id, record) {
           });
           const data = await r.json();
           if (data.ok) { location.reload(); return; }
+          banner.classList.remove('good'); banner.classList.add('bad');
           banner.textContent = data.error || 'Something went wrong. Please try again.';
           banner.classList.add('show');
+          if (data.locked) { btn.disabled = true; setTimeout(() => location.reload(), 1800); return; }
+          btn.disabled = false; btn.textContent = 'Complete registration';
+          checkValid();
         } catch (e) {
-          banner.textContent = 'Network error. Please check your connection and try again.';
-          banner.classList.add('show');
+          retryOnReconnect(attemptComplete);
         }
-        btn.disabled = false; btn.textContent = 'Complete registration';
-        checkValid();
+      }
+
+      btn.addEventListener('click', () => {
+        banner.classList.remove('show');
+        attemptComplete();
       });
     </script>`;
-  return shell(body, 'ATLAS — Academic Details', tokenPersistScript(id, record.sessionToken));
+  return shell(body, 'Study Buddy — Academic Details', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
 }
 
 // ── Stage 4: done ─────────────────────────────────────────────────────────────
@@ -632,9 +903,9 @@ function donePage(id, record) {
   const body = `
     <div class="center-icon">🎉</div>
     <h1 style="text-align:center;">You're all set, ${escapeHtml(record.username)}!</h1>
-    <div class="sub" style="text-align:center;margin-bottom:0;">Your ATLAS registration is complete. You can close this page and head back to WhatsApp.</div>`;
+    <div class="sub" style="text-align:center;margin-bottom:0;">Your Study Buddy registration is complete. You can close this page and head back to WhatsApp.</div>`;
   const cleanupScript = `<script>try{localStorage.removeItem('st_' + ${safeJson(id)});}catch(e){}</script>`;
-  return shell(body, 'ATLAS — Registration Complete', cleanupScript);
+  return shell(body, 'Study Buddy — Registration Complete', cleanupScript);
 }
 
 // ── Expired / recovery pages ──────────────────────────────────────────────────
@@ -642,8 +913,9 @@ function expiredPage() {
   const body = `
     <div class="center-icon">⏳</div>
     <h1 style="text-align:center;">Link expired</h1>
-    <div class="sub" style="text-align:center;margin-bottom:0;">This signup link is no longer valid — it may have expired or already been used. Please request a new one.</div>`;
-  return shell(body, 'ATLAS — Link Expired');
+    <div class="sub" style="text-align:center;">This signup link is no longer valid — it may have expired, been used too many times, or already been completed.</div>
+    <div class="sub" style="text-align:center;margin-bottom:0;"><a href="${STUDY_BUDDY_CONTACT_URL}" target="_blank" rel="noopener noreferrer" style="color:var(--accent2);font-weight:600;text-decoration:underline;">Contact Study Buddy</a> on WhatsApp to start again.</div>`;
+  return shell(body, 'Study Buddy — Link Expired');
 }
 
 function claimedPage(id) {
@@ -676,5 +948,5 @@ function claimedPage(id) {
         }
       })();
     </script>`;
-  return shell(body, 'ATLAS — Reconnecting');
+  return shell(body, 'Study Buddy — Reconnecting');
 }
