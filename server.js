@@ -27,10 +27,10 @@ const STUDY_BUDDY_CONTACT_URL = 'https://wa.me/2349136086344?text=Hello';
 // while the workflow is open in the editor). I've defaulted to the production
 // "webhook/..." path below since that's what should be used once deployed — swap to
 // "webhook-test/getEmail" only if you're still building the workflow in the n8n editor.
-const GET_EMAIL_URL    = 'https://smce-n8n.tx5mac.easypanel.host/webhook/getEmail';
-const VERIFY_EMAIL_URL = 'https://smce-n8n.tx5mac.easypanel.host/webhook/verifyEmail';
-const TERMS_URL        = 'https://smce-n8n.tx5mac.easypanel.host/webhook/termsAndConditions';
-const FINAL_URL        = 'https://smce-n8n.tx5mac.easypanel.host/webhook/final';
+const GET_EMAIL_URL    = 'https://sb-n8n.rhat7s.easypanel.host/webhook/getEmail';
+const VERIFY_EMAIL_URL = 'https://sb-n8n.rhat7s.easypanel.host/webhook/verifyEmail';
+const TERMS_URL        = 'https://sb-n8n.rhat7s.easypanel.host/webhook/termsAndConditions';
+const FINAL_URL        = 'https://sb-n8n.rhat7s.easypanel.host/webhook/final';
 
 // ── Atomic write queue (avoids race conditions / file corruption) ─────────────
 let storeWriteQueue = Promise.resolve();
