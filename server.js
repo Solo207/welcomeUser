@@ -706,174 +706,186 @@ function pinPage(id, record) {
       <a href="#" id="wrongEmailLink" style="color:var(--muted);font-size:.8rem;text-decoration:underline;">Wrong email? Go back</a>
     </div>
     <script>
-      const ID = ${idJson};
-      const RESEND_SECONDS = ${RESEND_COOLDOWN_SECONDS};
-      let RESEND_READY_AT = ${resendReadyAt};
-      const boxesEls = Array.from(document.querySelectorAll('.pin-box'));
-      const pinErr     = document.getElementById('pinErr');
-      const banner     = document.getElementById('banner');
-      const btn        = document.getElementById('submitBtn');
-      const resendBtn  = document.getElementById('resendBtn');
-      const wrongEmailLink = document.getElementById('wrongEmailLink');
+     const ID = ${idJson};
+const PIN_LEN = ${PIN_LENGTH};
+const RESEND_SECONDS = ${RESEND_COOLDOWN_SECONDS};
+let RESEND_READY_AT = ${resendReadyAt};
+const boxesEls = Array.from(document.querySelectorAll('.pin-box'));
+const pinErr     = document.getElementById('pinErr');
+const banner     = document.getElementById('banner');
+const btn        = document.getElementById('submitBtn');
+const resendBtn  = document.getElementById('resendBtn');
+const wrongEmailLink = document.getElementById('wrongEmailLink');
+let verifying = false; // guards against double-submit (auto-trigger + manual tap racing)
 
-      function disableEverything() {
-        boxesEls.forEach(b => b.disabled = true);
-        btn.disabled = true;
-        resendBtn.disabled = true;
-        wrongEmailLink.style.pointerEvents = 'none';
-        wrongEmailLink.style.opacity = '.4';
-      }
-      function showBanner(msg, good) {
-        banner.textContent = msg;
-        banner.classList.toggle('good', !!good);
-        banner.classList.toggle('bad', !good);
-        banner.classList.add('show');
-      }
-      function lockedOut(msg) {
-        showBanner(msg, false);
-        disableEverything();
-        setTimeout(() => location.reload(), 1800);
-      }
+function disableEverything() {
+  boxesEls.forEach(b => b.disabled = true);
+  btn.disabled = true;
+  resendBtn.disabled = true;
+  wrongEmailLink.style.pointerEvents = 'none';
+  wrongEmailLink.style.opacity = '.4';
+}
+function showBanner(msg, good) {
+  banner.textContent = msg;
+  banner.classList.toggle('good', !!good);
+  banner.classList.toggle('bad', !good);
+  banner.classList.add('show');
+}
+function lockedOut(msg) {
+  showBanner(msg, false);
+  disableEverything();
+  setTimeout(() => location.reload(), 1800);
+}
 
-      // If a submit fails purely due to a dropped connection (not a real error response),
-      // wait for the browser to report it's back online (or 8s, whichever first) and retry
-      // automatically — no need for the user to tap the button again.
-      function retryOnReconnect(attemptFn) {
-        showBanner("No connection — we'll retry automatically once you're back online.", false);
-        let fired = false, timer;
-        function retryNow() {
-          if (fired) return;
-          fired = true;
-          window.removeEventListener('online', retryNow);
-          clearTimeout(timer);
-          showBanner('Reconnected — retrying…', false);
-          attemptFn();
-        }
-        window.addEventListener('online', retryNow);
-        timer = setTimeout(retryNow, 8000);
-      }
+function retryOnReconnect(attemptFn) {
+  showBanner("No connection — we'll retry automatically once you're back online.", false);
+  let fired = false, timer;
+  function retryNow() {
+    if (fired) return;
+    fired = true;
+    window.removeEventListener('online', retryNow);
+    clearTimeout(timer);
+    showBanner('Reconnected — retrying…', false);
+    attemptFn();
+  }
+  window.addEventListener('online', retryNow);
+  timer = setTimeout(retryNow, 8000);
+}
 
-      boxesEls.forEach((el, i) => {
-        el.addEventListener('input', () => {
-          el.value = el.value.replace(/[^0-9]/g, '').slice(0, 1);
-          if (el.value && i < boxesEls.length - 1) boxesEls[i + 1].focus();
-        });
-        el.addEventListener('keydown', (e) => {
-          if (e.key === 'Backspace' && !el.value && i > 0) boxesEls[i - 1].focus();
-        });
-        el.addEventListener('paste', (e) => {
-          e.preventDefault();
-          const digits = (e.clipboardData.getData('text') || '').replace(/[^0-9]/g, '').split('');
-          boxesEls.forEach((b, j) => { b.value = digits[j] || ''; });
-          (boxesEls[Math.min(digits.length, boxesEls.length) - 1] || boxesEls[0]).focus();
-        });
-      });
-      function currentCode() { return boxesEls.map(b => b.value).join(''); }
+function currentCode() { return boxesEls.map(b => b.value).join(''); }
 
-      async function attemptVerify() {
-        btn.disabled = true; btn.textContent = 'Verifying…';
-        try {
-          const r = await fetch('/signup/' + ID + '/verify', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin',
-            body: JSON.stringify({ code: currentCode() })
-          });
-          const data = await r.json();
-          if (data.ok) { location.reload(); return; }
-          if (data.locked) { lockedOut(data.error || 'Too many incorrect attempts.'); return; }
-          showBanner(data.error || 'Incorrect code, try again.', false);
-          boxesEls.forEach(b => b.value = '');
-          boxesEls[0].focus();
-          btn.disabled = false; btn.textContent = 'Verify code';
-        } catch (e) {
-          retryOnReconnect(attemptVerify);
-        }
-      }
+// Fires the moment all PIN_LEN digits are present — no button tap required.
+function maybeAutoSubmit() {
+  if (verifying) return;
+  if (currentCode().length === PIN_LEN) {
+    pinErr.classList.remove('show');
+    attemptVerify();
+  }
+}
 
-      btn.addEventListener('click', () => {
-        banner.classList.remove('show');
-        const code = currentCode();
-        if (code.length !== ${PIN_LENGTH}) { pinErr.classList.add('show'); return; }
-        pinErr.classList.remove('show');
-        attemptVerify();
-      });
+boxesEls.forEach((el, i) => {
+  el.addEventListener('input', () => {
+    el.value = el.value.replace(/[^0-9]/g, '').slice(0, 1);
+    if (el.value && i < boxesEls.length - 1) boxesEls[i + 1].focus();
+    maybeAutoSubmit();
+  });
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'Backspace' && !el.value && i > 0) boxesEls[i - 1].focus();
+  });
+  el.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const digits = (e.clipboardData.getData('text') || '').replace(/[^0-9]/g, '').split('');
+    boxesEls.forEach((b, j) => { b.value = digits[j] || ''; });
+    (boxesEls[Math.min(digits.length, boxesEls.length) - 1] || boxesEls[0]).focus();
+    maybeAutoSubmit();
+  });
+});
+
+async function attemptVerify() {
+  verifying = true;
+  btn.disabled = true; btn.textContent = 'Verifying…';
+  try {
+    const r = await fetch('/signup/' + ID + '/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin',
+      body: JSON.stringify({ code: currentCode() })
+    });
+    const data = await r.json();
+    if (data.ok) { location.reload(); return; }
+    if (data.locked) { lockedOut(data.error || 'Too many incorrect attempts.'); return; }
+    showBanner(data.error || 'Incorrect code, try again.', false);
+    boxesEls.forEach(b => b.value = '');
+    boxesEls[0].focus();
+    btn.disabled = false; btn.textContent = 'Verify code';
+    verifying = false;
+  } catch (e) {
+    verifying = false;
+    retryOnReconnect(attemptVerify);
+  }
+}
+
+// Manual tap still works as a fallback (e.g. if autofill drops an input event).
+btn.addEventListener('click', () => {
+  banner.classList.remove('show');
+  const code = currentCode();
+  if (code.length !== PIN_LEN) { pinErr.classList.add('show'); return; }
+  pinErr.classList.remove('show');
+  attemptVerify();
+});
+boxesEls[0].focus();
+
+async function attemptBackToEmail() {
+  try {
+    const r = await fetch('/signup/' + ID + '/back-to-email', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: '{}'
+    });
+    const data = await r.json();
+    if (data.locked) { lockedOut(data.error); return; }
+    if (data.ok) { location.reload(); return; }
+    showBanner(data.error || 'Something went wrong. Please try again.', false);
+  } catch (err) {
+    retryOnReconnect(attemptBackToEmail);
+  }
+}
+
+wrongEmailLink.addEventListener('click', (e) => {
+  e.preventDefault();
+  banner.classList.remove('show');
+  attemptBackToEmail();
+});
+
+let resendCooldown = 0;
+let cooldownInterval = null;
+function startResendCooldown(seconds) {
+  clearInterval(cooldownInterval);
+  resendCooldown = seconds;
+  resendBtn.disabled = true;
+  resendBtn.textContent = 'Resend code (' + resendCooldown + 's)';
+  cooldownInterval = setInterval(() => {
+    resendCooldown--;
+    if (resendCooldown <= 0) {
+      clearInterval(cooldownInterval);
+      resendBtn.disabled = false;
+      resendBtn.textContent = 'Resend code';
+    } else {
+      resendBtn.textContent = 'Resend code (' + resendCooldown + 's)';
+    }
+  }, 1000);
+}
+
+function syncResendCooldown() {
+  const remaining = Math.ceil((RESEND_READY_AT - Date.now()) / 1000);
+  if (remaining > 0) startResendCooldown(remaining);
+  else { clearInterval(cooldownInterval); resendBtn.disabled = false; resendBtn.textContent = 'Resend code'; }
+}
+
+async function attemptResend() {
+  resendBtn.disabled = true;
+  try {
+    const r = await fetch('/signup/' + ID + '/resend', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: '{}'
+    });
+    const data = await r.json();
+    if (data.locked) { lockedOut(data.error); return; }
+    if (data.ok) {
+      showBanner('A new code has been sent to your email.', true);
+      boxesEls.forEach(b => b.value = '');
       boxesEls[0].focus();
+      RESEND_READY_AT = data.resendReadyAt || (Date.now() + RESEND_SECONDS * 1000);
+      syncResendCooldown();
+      return;
+    }
+    showBanner(data.error || 'Could not resend the code.', false);
+    resendBtn.disabled = false;
+  } catch (e) {
+    retryOnReconnect(attemptResend);
+  }
+}
 
-      async function attemptBackToEmail() {
-        try {
-          const r = await fetch('/signup/' + ID + '/back-to-email', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: '{}'
-          });
-          const data = await r.json();
-          if (data.locked) { lockedOut(data.error); return; }
-          if (data.ok) { location.reload(); return; }
-          showBanner(data.error || 'Something went wrong. Please try again.', false);
-        } catch (err) {
-          retryOnReconnect(attemptBackToEmail);
-        }
-      }
-
-      wrongEmailLink.addEventListener('click', (e) => {
-        e.preventDefault();
-        banner.classList.remove('show');
-        attemptBackToEmail();
-      });
-
-      let resendCooldown = 0;
-      let cooldownInterval = null;
-      function startResendCooldown(seconds) {
-        clearInterval(cooldownInterval);
-        resendCooldown = seconds;
-        resendBtn.disabled = true;
-        resendBtn.textContent = 'Resend code (' + resendCooldown + 's)';
-        cooldownInterval = setInterval(() => {
-          resendCooldown--;
-          if (resendCooldown <= 0) {
-            clearInterval(cooldownInterval);
-            resendBtn.disabled = false;
-            resendBtn.textContent = 'Resend code';
-          } else {
-            resendBtn.textContent = 'Resend code (' + resendCooldown + 's)';
-          }
-        }, 1000);
-      }
-
-      // Derives the cooldown from RESEND_READY_AT (a real server timestamp) rather than
-      // always restarting a fresh RESEND_SECONDS countdown — so a page refresh shows the
-      // true time remaining instead of resetting the wait every time.
-      function syncResendCooldown() {
-        const remaining = Math.ceil((RESEND_READY_AT - Date.now()) / 1000);
-        if (remaining > 0) startResendCooldown(remaining);
-        else { clearInterval(cooldownInterval); resendBtn.disabled = false; resendBtn.textContent = 'Resend code'; }
-      }
-
-      async function attemptResend() {
-        resendBtn.disabled = true;
-        try {
-          const r = await fetch('/signup/' + ID + '/resend', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: '{}'
-          });
-          const data = await r.json();
-          if (data.locked) { lockedOut(data.error); return; }
-          if (data.ok) {
-            showBanner('A new code has been sent to your email.', true);
-            boxesEls.forEach(b => b.value = '');
-            boxesEls[0].focus();
-            RESEND_READY_AT = data.resendReadyAt || (Date.now() + RESEND_SECONDS * 1000);
-            syncResendCooldown();
-            return;
-          }
-          showBanner(data.error || 'Could not resend the code.', false);
-          resendBtn.disabled = false;
-        } catch (e) {
-          retryOnReconnect(attemptResend);
-        }
-      }
-
-      resendBtn.addEventListener('click', () => {
-        banner.classList.remove('show');
-        attemptResend();
-      });
-      syncResendCooldown(); // reflect the real time left, not a fresh cooldown on every reload
+resendBtn.addEventListener('click', () => {
+  banner.classList.remove('show');
+  attemptResend();
+});
+syncResendCooldown();
     </script>`;
   return shell(body, 'Study Buddy — Enter Code', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
 }
