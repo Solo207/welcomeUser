@@ -461,15 +461,15 @@ const BASE_STYLE = `
   .bg-particles{
     position:fixed;inset:-40px;z-index:0;pointer-events:none;opacity:.8;
     background-image:
-      radial-gradient(2.2px 2.2px at 12% 22%, rgba(226,232,240,.75) 0%, transparent 60%),
-      radial-gradient(2.2px 2.2px at 68% 14%, rgba(226,232,240,.6) 0%, transparent 60%),
-      radial-gradient(1.8px 1.8px at 38% 68%, rgba(226,232,240,.65) 0%, transparent 60%),
-      radial-gradient(2.2px 2.2px at 86% 52%, rgba(226,232,240,.55) 0%, transparent 60%),
-      radial-gradient(1.8px 1.8px at 8% 82%, rgba(226,232,240,.6) 0%, transparent 60%),
-      radial-gradient(2.2px 2.2px at 55% 90%, rgba(226,232,240,.55) 0%, transparent 60%),
-      radial-gradient(1.8px 1.8px at 92% 28%, rgba(226,232,240,.65) 0%, transparent 60%),
-      radial-gradient(2.2px 2.2px at 28% 46%, rgba(226,232,240,.5) 0%, transparent 60%),
-      radial-gradient(1.8px 1.8px at 78% 78%, rgba(226,232,240,.55) 0%, transparent 60%);
+      radial-gradient(3.6px 3.6px at 12% 22%, rgba(226,232,240,.75) 0%, transparent 60%),
+      radial-gradient(3.6px 3.6px at 68% 14%, rgba(226,232,240,.6) 0%, transparent 60%),
+      radial-gradient(3px 3px at 38% 68%, rgba(226,232,240,.65) 0%, transparent 60%),
+      radial-gradient(3.6px 3.6px at 86% 52%, rgba(226,232,240,.55) 0%, transparent 60%),
+      radial-gradient(3px 3px at 8% 82%, rgba(226,232,240,.6) 0%, transparent 60%),
+      radial-gradient(3.6px 3.6px at 55% 90%, rgba(226,232,240,.55) 0%, transparent 60%),
+      radial-gradient(3px 3px at 92% 28%, rgba(226,232,240,.65) 0%, transparent 60%),
+      radial-gradient(3.6px 3.6px at 28% 46%, rgba(226,232,240,.5) 0%, transparent 60%),
+      radial-gradient(3px 3px at 78% 78%, rgba(226,232,240,.55) 0%, transparent 60%);
     animation:driftParticles 14s ease-in-out infinite;
   }
   @keyframes driftParticles{
