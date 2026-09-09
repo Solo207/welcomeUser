@@ -448,44 +448,44 @@ const BASE_STYLE = `
 
   /* Slow-spinning colour wash behind everything else — the "depth" layer */
   .bg-aura{
-    position:fixed;inset:-25%;z-index:0;pointer-events:none;opacity:.7;
+    position:fixed;inset:-25%;z-index:0;pointer-events:none;opacity:.9;
     background:conic-gradient(from 0deg at 50% 50%,
-      rgba(59,130,246,.14), rgba(20,184,166,.10), rgba(124,58,237,.14),
-      rgba(59,130,246,.10), rgba(20,184,166,.12), rgba(59,130,246,.14));
-    filter:blur(90px);
-    animation:auraSpin 30s linear infinite;
+      rgba(59,130,246,.24), rgba(20,184,166,.18), rgba(124,58,237,.24),
+      rgba(59,130,246,.18), rgba(20,184,166,.20), rgba(59,130,246,.24));
+    filter:blur(65px);
+    animation:auraSpin 20s linear infinite;
   }
   @keyframes auraSpin{ to{ transform:rotate(360deg); } }
 
   /* Faint drifting starfield for texture */
   .bg-particles{
-    position:fixed;inset:-40px;z-index:0;pointer-events:none;opacity:.55;
+    position:fixed;inset:-40px;z-index:0;pointer-events:none;opacity:.8;
     background-image:
-      radial-gradient(1.6px 1.6px at 12% 22%, rgba(226,232,240,.55) 0%, transparent 60%),
-      radial-gradient(1.6px 1.6px at 68% 14%, rgba(226,232,240,.4) 0%, transparent 60%),
-      radial-gradient(1.3px 1.3px at 38% 68%, rgba(226,232,240,.45) 0%, transparent 60%),
-      radial-gradient(1.6px 1.6px at 86% 52%, rgba(226,232,240,.35) 0%, transparent 60%),
-      radial-gradient(1.3px 1.3px at 8% 82%, rgba(226,232,240,.4) 0%, transparent 60%),
-      radial-gradient(1.6px 1.6px at 55% 90%, rgba(226,232,240,.35) 0%, transparent 60%),
-      radial-gradient(1.3px 1.3px at 92% 28%, rgba(226,232,240,.45) 0%, transparent 60%),
-      radial-gradient(1.6px 1.6px at 28% 46%, rgba(226,232,240,.3) 0%, transparent 60%),
-      radial-gradient(1.3px 1.3px at 78% 78%, rgba(226,232,240,.35) 0%, transparent 60%);
-    animation:driftParticles 22s ease-in-out infinite;
+      radial-gradient(2.2px 2.2px at 12% 22%, rgba(226,232,240,.75) 0%, transparent 60%),
+      radial-gradient(2.2px 2.2px at 68% 14%, rgba(226,232,240,.6) 0%, transparent 60%),
+      radial-gradient(1.8px 1.8px at 38% 68%, rgba(226,232,240,.65) 0%, transparent 60%),
+      radial-gradient(2.2px 2.2px at 86% 52%, rgba(226,232,240,.55) 0%, transparent 60%),
+      radial-gradient(1.8px 1.8px at 8% 82%, rgba(226,232,240,.6) 0%, transparent 60%),
+      radial-gradient(2.2px 2.2px at 55% 90%, rgba(226,232,240,.55) 0%, transparent 60%),
+      radial-gradient(1.8px 1.8px at 92% 28%, rgba(226,232,240,.65) 0%, transparent 60%),
+      radial-gradient(2.2px 2.2px at 28% 46%, rgba(226,232,240,.5) 0%, transparent 60%),
+      radial-gradient(1.8px 1.8px at 78% 78%, rgba(226,232,240,.55) 0%, transparent 60%);
+    animation:driftParticles 14s ease-in-out infinite;
   }
   @keyframes driftParticles{
     0%,100%{transform:translate(0,0);}
-    50%{transform:translate(-16px,-22px);}
+    50%{transform:translate(-32px,-44px);}
   }
 
   .bg-grid{position:fixed;inset:0;z-index:0;pointer-events:none;
-    background-image:linear-gradient(rgba(99,102,241,.06) 1px,transparent 1px),linear-gradient(90deg,rgba(99,102,241,.06) 1px,transparent 1px);
-    background-size:44px 44px;animation:gridPulse 5s ease-in-out infinite;}
-  @keyframes gridPulse{0%,100%{opacity:.45;}50%{opacity:1;}}
-  .bg-orb{position:fixed;border-radius:50%;pointer-events:none;z-index:0;filter:blur(80px);}
-  .bg-orb-1{width:520px;height:520px;top:-160px;right:-120px;background:radial-gradient(circle,rgba(99,102,241,.2) 0%,transparent 70%);animation:orbFloat 9s ease-in-out infinite;}
-  .bg-orb-2{width:420px;height:420px;bottom:5%;left:-120px;background:radial-gradient(circle,rgba(20,184,166,.16) 0%,transparent 70%);animation:orbFloat 11s ease-in-out infinite reverse;}
-  .bg-orb-3{width:300px;height:300px;top:38%;left:62%;background:radial-gradient(circle,rgba(124,58,237,.16) 0%,transparent 70%);animation:orbFloat 13s ease-in-out infinite;}
-  @keyframes orbFloat{0%,100%{transform:translateY(0) scale(1);}50%{transform:translateY(-32px) scale(1.05);}}
+    background-image:linear-gradient(rgba(99,102,241,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(99,102,241,.11) 1px,transparent 1px);
+    background-size:44px 44px;animation:gridPulse 4s ease-in-out infinite;}
+  @keyframes gridPulse{0%,100%{opacity:.55;}50%{opacity:1;}}
+  .bg-orb{position:fixed;border-radius:50%;pointer-events:none;z-index:0;filter:blur(60px);}
+  .bg-orb-1{width:600px;height:600px;top:-160px;right:-120px;background:radial-gradient(circle,rgba(99,102,241,.32) 0%,transparent 70%);animation:orbFloat 7s ease-in-out infinite;}
+  .bg-orb-2{width:480px;height:480px;bottom:5%;left:-120px;background:radial-gradient(circle,rgba(20,184,166,.28) 0%,transparent 70%);animation:orbFloat 9s ease-in-out infinite reverse;}
+  .bg-orb-3{width:360px;height:360px;top:38%;left:62%;background:radial-gradient(circle,rgba(124,58,237,.28) 0%,transparent 70%);animation:orbFloat 10s ease-in-out infinite;}
+  @keyframes orbFloat{0%,100%{transform:translateY(0) scale(1);}50%{transform:translateY(-50px) scale(1.1);}}
   .wrap{max-width:440px;margin:0 auto;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px 16px;position:relative;z-index:1;}
   .card{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:32px 26px;width:100%;animation:slideIn .35s cubic-bezier(.4,0,.2,1);}
   @keyframes slideIn{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:translateY(0);}}
@@ -502,7 +502,7 @@ const BASE_STYLE = `
     font-family:'Sora',sans-serif;font-size:.92rem;padding:13px 14px;outline:none;transition:border-color .2s;margin-bottom:4px;
   }
   input:focus,select:focus{border-color:var(--accent);}
-  input[readonly]{color:var(--muted);cursor:default;}
+  input[readonly]{color:var(--text);cursor:default;background:var(--surface2);}
   select:disabled{opacity:.45;cursor:not-allowed;}
   .field{margin-bottom:18px;}
   .err{color:var(--bad);font-size:.78rem;margin-top:6px;min-height:1em;display:none;}
@@ -1012,9 +1012,11 @@ function donePage(id, record) {
   const body = `
     <div class="center-icon">🎉</div>
     <h1 style="text-align:center;">You're all set, ${escapeHtml(record.username)}!</h1>
-    <div class="sub" style="text-align:center;margin-bottom:0;">Your Study Buddy registration is complete. You can close this page and head back to WhatsApp.</div>`;
+    <div class="sub" style="text-align:center;margin-bottom:0;">Your Study Buddy registration is complete. Taking you back to WhatsApp…</div>`;
   const cleanupScript = `<script>try{localStorage.removeItem('st_' + ${safeJson(id)});}catch(e){}</script>`;
-  return shell(body, 'Study Buddy — Registration Complete', cleanupScript);
+  // Give the user ~3s to see the confirmation, then hand them back to WhatsApp.
+  const redirectScript = `<script>setTimeout(function(){ window.location.href = ${safeJson(STUDY_BUDDY_CONTACT_URL)}; }, 3000);</script>`;
+  return shell(body, 'Study Buddy — Registration Complete', cleanupScript + redirectScript);
 }
 
 // ── Expired / recovery pages ──────────────────────────────────────────────────
