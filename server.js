@@ -14,12 +14,14 @@ const STORE_FILE     = path.join(__dirname, 'signups.json');
 const TTL_MS          = 2 * 60 * 60 * 1000; // 2 hours — link + whole flow expires after this
 const PIN_LENGTH       = 5;
 const MAX_PIN_ATTEMPTS = 3; // link is invalidated after this many wrong codes
-const MAX_EMAIL_CHANGES = 3; // link is invalidated after this many "wrong email, go back" clicks
+const MAX_PHONE_CHANGES = 3; // link is invalidated after this many "wrong number, go back" clicks
 const MAX_RESEND        = 3; // link is invalidated after this many "resend code" taps
 const RESEND_COOLDOWN_SECONDS = 60; // how long the resend button stays disabled after each send
+const COUNTRY_CODE  = '234'; // shown as a fixed, uneditable +234 in front of the number boxes
+const PHONE_LENGTH  = 10;    // digits the user types after +234 (no leading 0)
 
 const ADMIN_CONTACT_URL = 'https://wa.me/2348138450036?text=Hello%2C%20I%20need%20your%20help';
-const STUDY_BUDDY_CONTACT_URL = 'https://wa.me/2349136086344?text=Hello';
+const CONTACT_URL = 'https://wa.me/2349136086344?text=Hello';
 
 // NOTE ON THIS URL: the message this was spec'd from pasted a markdown link where the
 // *visible* text was ".../webhook/getEmail" but the *actual* href was
@@ -27,8 +29,11 @@ const STUDY_BUDDY_CONTACT_URL = 'https://wa.me/2349136086344?text=Hello';
 // while the workflow is open in the editor). I've defaulted to the production
 // "webhook/..." path below since that's what should be used once deployed — swap to
 // "webhook-test/getEmail" only if you're still building the workflow in the n8n editor.
-const GET_EMAIL_URL    = 'https://sb-n8n.rhat7s.easypanel.host/webhook/getEmail';
-const VERIFY_EMAIL_URL = 'https://sb-n8n.rhat7s.easypanel.host/webhook/verifyEmail';
+// NOTE: SEND_CODE_URL / VERIFY_CODE_URL still point at the old getEmail / verifyEmail
+// workflows. They now receive { wa_id, username, phone } and { code, wa_id, phone } —
+// point them at new n8n webhooks if you create separate ones for the phone flow.
+const SEND_CODE_URL    = 'https://sb-n8n.rhat7s.easypanel.host/webhook/getEmail';
+const VERIFY_CODE_URL  = 'https://sb-n8n.rhat7s.easypanel.host/webhook/verifyEmail';
 const TERMS_URL        = 'https://sb-n8n.rhat7s.easypanel.host/webhook/termsAndConditions';
 const FINAL_URL        = 'https://sb-n8n.rhat7s.easypanel.host/webhook/final';
 
@@ -54,16 +59,16 @@ function isExpired(record) {
 }
 
 // Builds and sends the final-webhook payload for either outcome. Always includes
-// whatever the record has captured so far (email/school/department/level may be null
+// whatever the record has captured so far (phone/school/department/level may be null
 // if the flow never got that far) plus a status field, and a reason code on failure so
 // your n8n workflow can tell WHY it failed.
-// Reason codes: 'link_expired' | 'max_pin_attempts' | 'max_email_changes' |
+// Reason codes: 'link_expired' | 'max_pin_attempts' | 'max_phone_changes' |
 //               'max_resend_attempts' | 'superseded_by_new_link'
 async function sendFinalWebhook(record, status, reason) {
   const payload = {
     wa_id: record.wa_id,
     username: record.username,
-    email: record.email || null,
+    phone: record.phone || null,
     school: record.school || null,
     department: record.department || null,
     level: record.level || null,
@@ -141,8 +146,22 @@ function safeJson(obj) {
   return JSON.stringify(obj).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
 }
 
-function isValidEmail(email) {
-  return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) && email.length <= 254;
+function isValidPhone(digits) {
+  return typeof digits === 'string' && new RegExp('^[1-9][0-9]{' + (PHONE_LENGTH - 1) + '}$').test(digits);
+}
+
+// '2348031234567' → '+234 803 123 4567'
+function formatPhone(full) {
+  const local = String(full || '').slice(COUNTRY_CODE.length);
+  return `+${COUNTRY_CODE} ${local.slice(0, 3)} ${local.slice(3, 6)} ${local.slice(6)}`.trim();
+}
+
+// Only plain http(s) URLs are accepted as the post-registration redirect target — this
+// rules out javascript:, data: and similar schemes.
+function isValidRedirectUrl(u) {
+  if (typeof u !== 'string') return false;
+  try { const p = new URL(u.trim()); return p.protocol === 'https:' || p.protocol === 'http:'; }
+  catch (e) { return false; }
 }
 
 function isValidPin(code) {
@@ -171,12 +190,14 @@ async function callWebhook(url, payload) {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// POST /create-signup  { wa_id, username } → { link, id }
+// POST /create-signup  { wa_id, username, url } → { link, id }
+// `url` is where the user is sent (same tab, immediately) once step 3 is complete.
 // If this wa_id already has an active (non-done) link, it's invalidated first — see
 // invalidateActiveByWaId — so at most one signup link can ever be "live" per wa_id.
 app.post('/create-signup', async (req, res) => {
-  const { wa_id, username } = req.body || {};
-  if (!wa_id || !username) return res.status(400).json({ error: 'Missing wa_id or username' });
+  const { wa_id, username, url } = req.body || {};
+  if (!wa_id || !username || !url) return res.status(400).json({ error: 'Missing wa_id, username or url' });
+  if (!isValidRedirectUrl(url)) return res.status(400).json({ error: 'url must be a valid http(s) URL' });
 
   const id      = uuidv4();
   const waIdStr = String(wa_id);
@@ -186,15 +207,16 @@ app.post('/create-signup', async (req, res) => {
   store[id] = {
     wa_id: waIdStr,
     username: String(username),
+    redirectUrl: String(url).trim(),
     createdAt: Date.now(),
     expiresAt: Date.now() + TTL_MS,
     claimed: false,
     sessionToken: null,
-    stage: 'email',            // email → pin → details → done
-    email: null,
+    stage: 'phone',            // phone → pin → details → done
+    phone: null,               // full number incl. country code, e.g. 2348031234567
     academicOptions: null,
     attempts: 0,
-    emailChanges: 0,
+    phoneChanges: 0,
     resendCount: 0,
     lastCodeSentAt: null       // set whenever a code actually goes out — drives the resend cooldown
   };
@@ -207,7 +229,7 @@ app.post('/create-signup', async (req, res) => {
 
 // GET /signup/:id — serves whichever stage the record is actually on server-side.
 // This is what makes it impossible to reach the pin page (or beyond) without a real,
-// server-confirmed email step: the HTML for a later stage is never generated or sent
+// server-confirmed phone step: the HTML for a later stage is never generated or sent
 // until this record's `stage` field has actually advanced.
 app.get('/signup/:id', async (req, res) => {
   const store  = await cleanup(loadStore());
@@ -260,7 +282,7 @@ async function loadGuardedRecord(req, res, expectedStage) {
     await sendFinalWebhook(record, 'failed', 'link_expired');
     delete store[req.params.id];
     saveStore(store);
-    res.status(410).json({ ok: false, locked: true, error: 'This link has expired. Contact Study Buddy on WhatsApp to start again.' });
+    res.status(410).json({ ok: false, locked: true, error: 'This link has expired. Contact RoughBOOK on WhatsApp to start again.' });
     return null;
   }
 
@@ -272,34 +294,37 @@ async function loadGuardedRecord(req, res, expectedStage) {
   return { store, record };
 }
 
-// POST /signup/:id/email  { email } → sends verification code via n8n, advances to 'pin'
-app.post('/signup/:id/email', async (req, res) => {
-  const ctx = await loadGuardedRecord(req, res, 'email');
+// POST /signup/:id/phone  { phone } → sends verification code via n8n, advances to 'pin'
+// `phone` is the 10 digits typed after the fixed +234; the full number is built here.
+app.post('/signup/:id/phone', async (req, res) => {
+  const ctx = await loadGuardedRecord(req, res, 'phone');
   if (!ctx) return;
   const { store, record } = ctx;
 
-  const email = (req.body?.email || '').trim();
-  if (!isValidEmail(email)) return res.status(400).json({ ok: false, error: 'Please enter a valid email address.' });
+  const digits = String(req.body?.phone || '').replace(/\D/g, '');
+  if (!isValidPhone(digits)) {
+    return res.status(400).json({ ok: false, error: `Please enter all ${PHONE_LENGTH} digits of your WhatsApp number.` });
+  }
+  const fullNumber = COUNTRY_CODE + digits;
 
-  const result = await callWebhook(GET_EMAIL_URL, { wa_id: record.wa_id, username: record.username, email });
+  const result = await callWebhook(SEND_CODE_URL, { wa_id: record.wa_id, username: record.username, phone: fullNumber });
   if (!result.reachable) return res.status(502).json({ ok: false, error: 'Could not reach the verification service. Please try again.' });
 
-  // This webhook can respond with a plain-text body (e.g. "email already exist")
-  // rather than JSON, so the check has to look at the raw text too, not just JSON
-  // fields — otherwise a non-JSON response silently falls through as a success.
+  // The webhook can respond with a plain-text body (e.g. "already exists") rather than
+  // JSON, so the check has to look at the raw text too, not just JSON fields.
   const responseText = String(result.data?.error || result.data?.message || result.raw || '');
-  const emailTaken = result.data?.exists === true
-    || result.data?.emailExists === true
+  const phoneTaken = result.data?.exists === true
+    || result.data?.phoneExists === true
     || /already\s*(exist|registered|in use|taken)/i.test(responseText);
-  if (emailTaken) {
-    return res.status(400).json({ ok: false, error: 'That email is already registered — please enter another.' });
+  if (phoneTaken) {
+    return res.status(400).json({ ok: false, error: 'That number is already registered — please enter another.' });
   }
 
   if (!result.httpOk || result.data?.ok === false || result.data?.error) {
-    return res.status(400).json({ ok: false, error: result.data?.error || result.data?.message || 'Could not send a verification code to that email. Please try again.' });
+    return res.status(400).json({ ok: false, error: result.data?.error || result.data?.message || 'Could not send a verification code to that number. Please try again.' });
   }
 
-  record.email          = email;
+  record.phone          = fullNumber;
   record.stage          = 'pin';
   record.attempts       = 0;
   record.resendCount    = 0;
@@ -308,7 +333,7 @@ app.post('/signup/:id/email', async (req, res) => {
   res.json({ ok: true });
 });
 
-// POST /signup/:id/resend — resends the code via the same getEmail webhook, capped at
+// POST /signup/:id/resend — resends the code via the same send-code webhook, capped at
 // MAX_RESEND uses. A network/webhook failure doesn't burn an attempt.
 app.post('/signup/:id/resend', async (req, res) => {
   const ctx = await loadGuardedRecord(req, res, 'pin');
@@ -320,10 +345,10 @@ app.post('/signup/:id/resend', async (req, res) => {
     await sendFinalWebhook(record, 'failed', 'max_resend_attempts');
     delete store[req.params.id];
     saveStore(store);
-    return res.json({ ok: false, locked: true, error: 'Too many resend attempts. Contact Study Buddy on WhatsApp to start again.' });
+    return res.json({ ok: false, locked: true, error: 'Too many resend attempts. Contact RoughBOOK on WhatsApp to start again.' });
   }
 
-  const result = await callWebhook(GET_EMAIL_URL, { wa_id: record.wa_id, username: record.username, email: record.email });
+  const result = await callWebhook(SEND_CODE_URL, { wa_id: record.wa_id, username: record.username, phone: record.phone });
   if (!result.reachable || !result.httpOk || result.data?.ok === false || result.data?.error) {
     record.resendCount -= 1; // don't charge an attempt if it didn't actually go out
     saveStore(store);
@@ -345,7 +370,7 @@ app.post('/signup/:id/verify', async (req, res) => {
   const code = String(req.body?.code || '').trim();
   if (!isValidPin(code)) return res.status(400).json({ ok: false, error: `Please enter the ${PIN_LENGTH}-digit code.` });
 
-  const result = await callWebhook(VERIFY_EMAIL_URL, { code, wa_id: record.wa_id, email: record.email });
+  const result = await callWebhook(VERIFY_CODE_URL, { code, wa_id: record.wa_id, phone: record.phone });
   if (!result.reachable) return res.status(502).json({ ok: false, error: 'Could not reach the verification service. Please try again.' });
 
   if (Array.isArray(result.data)) {
@@ -364,7 +389,7 @@ app.post('/signup/:id/verify', async (req, res) => {
     await sendFinalWebhook(record, 'failed', 'max_pin_attempts');
     delete store[req.params.id];
     saveStore(store);
-    return res.json({ ok: false, locked: true, error: 'Too many incorrect attempts. Contact Study Buddy on WhatsApp to start again.' });
+    return res.json({ ok: false, locked: true, error: 'Too many incorrect attempts. Contact RoughBOOK on WhatsApp to start again.' });
   }
   saveStore(store);
   const remaining = MAX_PIN_ATTEMPTS - record.attempts;
@@ -372,23 +397,23 @@ app.post('/signup/:id/verify', async (req, res) => {
   res.json({ ok: false, error: `${msg} (${remaining} attempt${remaining === 1 ? '' : 's'} left)` });
 });
 
-// POST /signup/:id/back-to-email — lets the user correct a mistyped email from the pin
-// page. Keeps the old (wrong) email pre-filled so they can just fix the typo, and caps
-// how many times this can happen so the getEmail webhook can't be spammed indefinitely.
-app.post('/signup/:id/back-to-email', async (req, res) => {
+// POST /signup/:id/back-to-phone — lets the user correct a mistyped number from the pin
+// page. Keeps the old (wrong) number pre-filled so they can just fix the typo, and caps
+// how many times this can happen so the send-code webhook can't be spammed indefinitely.
+app.post('/signup/:id/back-to-phone', async (req, res) => {
   const ctx = await loadGuardedRecord(req, res, 'pin');
   if (!ctx) return;
   const { store, record } = ctx;
 
-  record.emailChanges = (record.emailChanges || 0) + 1;
-  if (record.emailChanges > MAX_EMAIL_CHANGES) {
-    await sendFinalWebhook(record, 'failed', 'max_email_changes');
+  record.phoneChanges = (record.phoneChanges || 0) + 1;
+  if (record.phoneChanges > MAX_PHONE_CHANGES) {
+    await sendFinalWebhook(record, 'failed', 'max_phone_changes');
     delete store[req.params.id];
     saveStore(store);
-    return res.json({ ok: false, locked: true, error: 'Too many email changes. Contact Study Buddy on WhatsApp to start again.' });
+    return res.json({ ok: false, locked: true, error: 'Too many number changes. Contact RoughBOOK on WhatsApp to start again.' });
   }
 
-  record.stage    = 'email';
+  record.stage    = 'phone';
   record.attempts = 0;
   saveStore(store);
   res.json({ ok: true });
@@ -410,7 +435,7 @@ app.post('/signup/:id/complete', async (req, res) => {
   const payload = {
     wa_id: record.wa_id,
     username: record.username,
-    email: record.email,
+    phone: record.phone,
     school, department, level,
     agreed_terms: true,
     status: 'success',
@@ -426,10 +451,11 @@ app.post('/signup/:id/complete', async (req, res) => {
   record.school = school; record.department = department; record.level = level;
   record.stage  = 'done';
   saveStore(store);
-  res.json({ ok: true });
+  // The client redirects straight to this (same tab, no delay).
+  res.json({ ok: true, redirectUrl: record.redirectUrl || CONTACT_URL });
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'Study Buddy Signup' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'RoughBOOK Signup' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Signup app running on port ${PORT}`));
@@ -519,6 +545,14 @@ const BASE_STYLE = `
   .pin-box{width:100%;aspect-ratio:1;text-align:center;font-family:var(--mono);font-size:1.3rem;font-weight:600;
     background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text);outline:none;transition:border-color .2s;}
   .pin-box:focus{border-color:var(--accent);}
+  .phone-row{display:flex;align-items:stretch;gap:4px;margin-bottom:6px;}
+  .phone-prefix{display:flex;align-items:center;justify-content:center;flex-shrink:0;padding:0 10px;margin-right:4px;border-radius:10px;
+    background:var(--surface);border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:.95rem;font-weight:600;user-select:none;cursor:default;}
+  .phone-box{flex:1 1 0;min-width:0;height:46px;padding:0;text-align:center;font-family:var(--mono);font-size:1rem;font-weight:600;
+    background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);outline:none;transition:border-color .2s;}
+  .phone-box:focus{border-color:var(--accent);}
+  .phone-box.grp{margin-right:4px;}
+  @media(max-width:380px){.phone-prefix{padding:0 7px;font-size:.82rem;margin-right:2px;}.phone-row{gap:3px;}}
   .checkbox-row{display:flex;align-items:flex-start;gap:10px;margin:18px 0 22px;}
   .checkbox-row input{width:18px;height:18px;margin-top:1px;accent-color:var(--accent);flex-shrink:0;}
   .checkbox-row label{margin:0;font-size:.82rem;color:var(--muted);line-height:1.5;}
@@ -581,7 +615,7 @@ function expiryTimerScript(expiresAt) {
 }
 
 function stepDots(active) {
-  const labels = ['email','pin','details'];
+  const labels = ['phone','pin','details'];
   return `<div class="steps">${labels.map((l,i) => {
     const cls = i < labels.indexOf(active) ? 'done' : (i === labels.indexOf(active) ? 'active' : '');
     return `<div class="step-dot ${cls}"></div>`;
@@ -589,49 +623,98 @@ function stepDots(active) {
 }
 
 function renderPage(id, record) {
-  if (record.stage === 'email')   return emailPage(id, record);
+  if (record.stage === 'phone')   return phonePage(id, record);
   if (record.stage === 'pin')     return pinPage(id, record);
   if (record.stage === 'details') return detailsPage(id, record);
   if (record.stage === 'done')    return donePage(id, record);
   return expiredPage();
 }
 
-// ── Stage 1: email ────────────────────────────────────────────────────────────
-function emailPage(id, record) {
-  const idJson       = safeJson(id);
+// ── Stage 1: phone ────────────────────────────────────────────────────────────
+function phonePage(id, record) {
+  const idJson        = safeJson(id);
   const identityLabel = `${record.username} • ${record.wa_id}`;
+  // Coming back from the pin page ("Wrong number?") re-fills the boxes so the user only
+  // has to fix the typo.
+  const prefill = record.phone ? String(record.phone).slice(COUNTRY_CODE.length) : '';
+  const boxes = Array.from({ length: PHONE_LENGTH }, (_, i) =>
+    `<input class="phone-box${i === 2 || i === 5 ? ' grp' : ''}" maxlength="1" inputmode="numeric" pattern="[0-9]*" autocomplete="off" aria-label="Digit ${i + 1} of ${PHONE_LENGTH}"/>`).join('');
   const body = `
     <div class="expiry-timer" id="expiryTimer"></div>
-    <div class="eyebrow">Study Buddy Registration</div>
-    <h1>Let's verify your email</h1>
-    ${stepDots('email')}
-    <div class="sub">Confirm it's you, then enter the email you'd like linked to your account.</div>
+    <div class="eyebrow">RoughBOOK Registration</div>
+    <h1>Let's verify your number</h1>
+    ${stepDots('phone')}
+    <div class="sub">Enter the WhatsApp number you'd like linked to your account and we'll send you a verification code.</div>
     <div class="field">
       <label>Registering as</label>
       <input type="text" readonly value="${escapeHtml(identityLabel)}" tabindex="-1"/>
     </div>
     <div class="banner bad" id="banner"></div>
     <div class="field">
-      <label for="email">Email address</label>
-      <input type="email" id="email" placeholder="you@example.com" autocomplete="email" value="${escapeHtml(record.email || '')}"/>
-      <div class="err" id="emailErr">Please enter a valid email address.</div>
+      <label>WhatsApp number</label>
+      <div class="phone-row">
+        <div class="phone-prefix" aria-label="Country code plus ${COUNTRY_CODE}">+${COUNTRY_CODE}</div>
+        ${boxes}
+      </div>
+      <div class="err" id="phoneErr">Please enter all ${PHONE_LENGTH} digits (without the leading 0).</div>
     </div>
     <button class="btn" id="submitBtn">Send verification code</button>
     <script>
-      const ID = ${idJson};
-      const emailInput = document.getElementById('email');
-      const emailErr   = document.getElementById('emailErr');
-      const banner     = document.getElementById('banner');
-      const btn        = document.getElementById('submitBtn');
-      function isValidEmail(v) { return /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(v.trim()); }
+      const ID        = ${idJson};
+      const PHONE_LEN = ${PHONE_LENGTH};
+      const PREFILL   = ${safeJson(prefill)};
+      const boxesEls  = Array.from(document.querySelectorAll('.phone-box'));
+      const phoneErr  = document.getElementById('phoneErr');
+      const banner    = document.getElementById('banner');
+      const btn       = document.getElementById('submitBtn');
+
+      function currentDigits() { return boxesEls.map(b => b.value).join(''); }
+      function isComplete() {
+        const d = currentDigits();
+        return d.length === PHONE_LEN && d.charAt(0) !== '0';
+      }
       function validate(showError) {
-        const ok = isValidEmail(emailInput.value);
-        if (showError) emailErr.classList.toggle('show', !ok);
-        else if (ok) emailErr.classList.remove('show');
+        const ok = isComplete();
+        if (showError) phoneErr.classList.toggle('show', !ok);
+        else if (ok) phoneErr.classList.remove('show');
         return ok;
       }
-      emailInput.addEventListener('blur', () => validate(true));
-      emailInput.addEventListener('input', () => { if (emailErr.classList.contains('show')) validate(true); });
+
+      // Turns whatever was pasted (0803…, +234 803…, 234803…) into the 10 digits that
+      // follow the fixed +234.
+      function normalizePasted(raw) {
+        let d = String(raw || '').replace(/[^0-9]/g, '');
+        if (d.indexOf('234') === 0 && d.length > PHONE_LEN) d = d.slice(3);
+        d = d.replace(/^0+/, '');
+        return d.slice(0, PHONE_LEN);
+      }
+
+      boxesEls.forEach((el, i) => {
+        el.addEventListener('focus', () => el.select());
+        el.addEventListener('input', () => {
+          let v = el.value.replace(/[^0-9]/g, '');
+          if (i === 0 && v === '0') v = ''; // +234 already stands in for the leading 0
+          el.value = v.slice(0, 1);
+          if (el.value && i < boxesEls.length - 1) boxesEls[i + 1].focus();
+          validate(false);
+        });
+        el.addEventListener('keydown', (e) => {
+          if (e.key === 'Backspace' && !el.value && i > 0) { e.preventDefault(); boxesEls[i - 1].value = ''; boxesEls[i - 1].focus(); }
+          else if (e.key === 'ArrowLeft' && i > 0) { e.preventDefault(); boxesEls[i - 1].focus(); }
+          else if (e.key === 'ArrowRight' && i < boxesEls.length - 1) { e.preventDefault(); boxesEls[i + 1].focus(); }
+          else if (e.key === 'Enter') { btn.click(); }
+        });
+        el.addEventListener('paste', (e) => {
+          e.preventDefault();
+          const digits = normalizePasted((e.clipboardData || window.clipboardData).getData('text')).split('');
+          boxesEls.forEach((b, j) => { b.value = digits[j] || ''; });
+          boxesEls[Math.min(digits.length, boxesEls.length - 1)].focus();
+          validate(false);
+        });
+      });
+
+      PREFILL.split('').forEach((c, j) => { if (boxesEls[j]) boxesEls[j].value = c; });
+      boxesEls[Math.min(PREFILL.length, PHONE_LEN - 1)].focus();
 
       // If a submit fails purely due to a dropped connection (not a real error response),
       // wait for the browser to report it's back online (or 8s, whichever first) and retry
@@ -653,12 +736,12 @@ function emailPage(id, record) {
         timer = setTimeout(retryNow, 8000);
       }
 
-      async function attemptSendEmail() {
+      async function attemptSendPhone() {
         btn.disabled = true; btn.textContent = 'Sending…';
         try {
-          const r = await fetch('/signup/' + ID + '/email', {
+          const r = await fetch('/signup/' + ID + '/phone', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin',
-            body: JSON.stringify({ email: emailInput.value.trim() })
+            body: JSON.stringify({ phone: currentDigits() })
           });
           const data = await r.json();
           if (data.ok) { location.reload(); return; }
@@ -668,17 +751,17 @@ function emailPage(id, record) {
           if (data.locked) { btn.disabled = true; setTimeout(() => location.reload(), 1800); return; }
           btn.disabled = false; btn.textContent = 'Send verification code';
         } catch (e) {
-          retryOnReconnect(attemptSendEmail, banner);
+          retryOnReconnect(attemptSendPhone, banner);
         }
       }
 
       btn.addEventListener('click', () => {
         banner.classList.remove('show');
-        if (!validate(true)) { emailInput.focus(); return; }
-        attemptSendEmail();
+        if (!validate(true)) { (boxesEls.find(b => !b.value) || boxesEls[0]).focus(); return; }
+        attemptSendPhone();
       });
     </script>`;
-  return shell(body, 'Study Buddy — Verify Email', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
+  return shell(body, 'RoughBOOK — Verify Number', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
 }
 
 // ── Stage 2: pin ──────────────────────────────────────────────────────────────
@@ -693,17 +776,17 @@ function pinPage(id, record) {
   const resendReadyAt = (record.lastCodeSentAt || Date.now()) + RESEND_COOLDOWN_SECONDS * 1000;
   const body = `
     <div class="expiry-timer" id="expiryTimer"></div>
-    <div class="eyebrow">Study Buddy Registration</div>
+    <div class="eyebrow">RoughBOOK Registration</div>
     <h1>Enter your code</h1>
     ${stepDots('pin')}
-    <div class="sub">We sent a ${PIN_LENGTH}-digit code to <strong>${escapeHtml(record.email)}</strong>.</div>
+    <div class="sub">We sent a ${PIN_LENGTH}-digit code to <strong>${escapeHtml(formatPhone(record.phone))}</strong>.</div>
     <div class="banner bad" id="banner"></div>
     <div class="pin-row">${boxes}</div>
     <div class="err" id="pinErr" style="text-align:center;margin-bottom:14px;">Please enter all ${PIN_LENGTH} digits.</div>
     <button class="btn" id="submitBtn">Verify code</button>
     <div class="resend-row"><button type="button" class="resend-btn" id="resendBtn" disabled>Resend code</button></div>
     <div style="text-align:center;margin-top:10px;">
-      <a href="#" id="wrongEmailLink" style="color:var(--muted);font-size:.8rem;text-decoration:underline;">Wrong email? Go back</a>
+      <a href="#" id="wrongPhoneLink" style="color:var(--muted);font-size:.8rem;text-decoration:underline;">Wrong number? Go back</a>
     </div>
     <script>
      const ID = ${idJson};
@@ -715,15 +798,15 @@ const pinErr     = document.getElementById('pinErr');
 const banner     = document.getElementById('banner');
 const btn        = document.getElementById('submitBtn');
 const resendBtn  = document.getElementById('resendBtn');
-const wrongEmailLink = document.getElementById('wrongEmailLink');
+const wrongPhoneLink = document.getElementById('wrongPhoneLink');
 let verifying = false; // guards against double-submit (auto-trigger + manual tap racing)
 
 function disableEverything() {
   boxesEls.forEach(b => b.disabled = true);
   btn.disabled = true;
   resendBtn.disabled = true;
-  wrongEmailLink.style.pointerEvents = 'none';
-  wrongEmailLink.style.opacity = '.4';
+  wrongPhoneLink.style.pointerEvents = 'none';
+  wrongPhoneLink.style.opacity = '.4';
 }
 function showBanner(msg, good) {
   banner.textContent = msg;
@@ -813,9 +896,9 @@ btn.addEventListener('click', () => {
 });
 boxesEls[0].focus();
 
-async function attemptBackToEmail() {
+async function attemptBackToPhone() {
   try {
-    const r = await fetch('/signup/' + ID + '/back-to-email', {
+    const r = await fetch('/signup/' + ID + '/back-to-phone', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: '{}'
     });
     const data = await r.json();
@@ -823,14 +906,14 @@ async function attemptBackToEmail() {
     if (data.ok) { location.reload(); return; }
     showBanner(data.error || 'Something went wrong. Please try again.', false);
   } catch (err) {
-    retryOnReconnect(attemptBackToEmail);
+    retryOnReconnect(attemptBackToPhone);
   }
 }
 
-wrongEmailLink.addEventListener('click', (e) => {
+wrongPhoneLink.addEventListener('click', (e) => {
   e.preventDefault();
   banner.classList.remove('show');
-  attemptBackToEmail();
+  attemptBackToPhone();
 });
 
 let resendCooldown = 0;
@@ -867,7 +950,7 @@ async function attemptResend() {
     const data = await r.json();
     if (data.locked) { lockedOut(data.error); return; }
     if (data.ok) {
-      showBanner('A new code has been sent to your email.', true);
+      showBanner('A new code has been sent.', true);
       boxesEls.forEach(b => b.value = '');
       boxesEls[0].focus();
       RESEND_READY_AT = data.resendReadyAt || (Date.now() + RESEND_SECONDS * 1000);
@@ -887,7 +970,7 @@ resendBtn.addEventListener('click', () => {
 });
 syncResendCooldown();
     </script>`;
-  return shell(body, 'Study Buddy — Enter Code', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
+  return shell(body, 'RoughBOOK — Enter Code', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
 }
 
 // ── Stage 3: details ──────────────────────────────────────────────────────────
@@ -896,7 +979,7 @@ function detailsPage(id, record) {
   const optionsJson = safeJson(record.academicOptions);
   const body = `
     <div class="expiry-timer" id="expiryTimer"></div>
-    <div class="eyebrow">Study Buddy Registration</div>
+    <div class="eyebrow">RoughBOOK Registration</div>
     <h1>Almost done</h1>
     ${stepDots('details')}
     <div class="sub">Tell us where you study.</div>
@@ -987,7 +1070,12 @@ function detailsPage(id, record) {
             body: JSON.stringify({ school: schoolSel.value, department: deptSel.value, level: levelSel.value, agreed: agreeBox.checked })
           });
           const data = await r.json();
-          if (data.ok) { location.reload(); return; }
+          if (data.ok) {
+            try { localStorage.removeItem('st_' + ID); } catch (e) {}
+            // replace() (not href) so the Back button can't return to a finished form
+            if (data.redirectUrl) window.location.replace(data.redirectUrl); else location.reload();
+            return;
+          }
           banner.classList.remove('good'); banner.classList.add('bad');
           banner.textContent = data.error || 'Something went wrong. Please try again.';
           banner.classList.add('show');
@@ -1004,19 +1092,21 @@ function detailsPage(id, record) {
         attemptComplete();
       });
     </script>`;
-  return shell(body, 'Study Buddy — Academic Details', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
+  return shell(body, 'RoughBOOK — Academic Details', tokenPersistScript(id, record.sessionToken) + expiryTimerScript(record.expiresAt));
 }
 
 // ── Stage 4: done ─────────────────────────────────────────────────────────────
+// Normally the browser has already been sent to the redirect url straight from the
+// /complete response and never lands here. This page covers a reload / Back / revisit of
+// a finished link — it redirects immediately too, with a tap-through link as a fallback.
 function donePage(id, record) {
+  const url = record.redirectUrl || CONTACT_URL;
   const body = `
     <div class="center-icon">🎉</div>
     <h1 style="text-align:center;">You're all set, ${escapeHtml(record.username)}!</h1>
-    <div class="sub" style="text-align:center;margin-bottom:0;">Your Study Buddy registration is complete. Taking you back to WhatsApp…</div>`;
-  const cleanupScript = `<script>try{localStorage.removeItem('st_' + ${safeJson(id)});}catch(e){}</script>`;
-  // Give the user ~3s to see the confirmation, then hand them back to WhatsApp.
-  const redirectScript = `<script>setTimeout(function(){ window.location.href = ${safeJson(STUDY_BUDDY_CONTACT_URL)}; }, 3000);</script>`;
-  return shell(body, 'Study Buddy — Registration Complete', cleanupScript + redirectScript);
+    <div class="sub" style="text-align:center;margin-bottom:0;">Taking you there now… <a href="${escapeHtml(url)}" style="color:var(--accent2);text-decoration:underline;">Tap here</a> if nothing happens.</div>`;
+  const script = `<script>try{localStorage.removeItem('st_' + ${safeJson(id)});}catch(e){} window.location.replace(${safeJson(url)});</script>`;
+  return shell(body, 'RoughBOOK — Registration Complete', script);
 }
 
 // ── Expired / recovery pages ──────────────────────────────────────────────────
@@ -1025,8 +1115,8 @@ function expiredPage() {
     <div class="center-icon">⏳</div>
     <h1 style="text-align:center;">Link expired</h1>
     <div class="sub" style="text-align:center;">This signup link is no longer valid — it may have expired, been used too many times, been replaced by a newer link, or already been completed.</div>
-    <div class="sub" style="text-align:center;margin-bottom:0;"><a href="${STUDY_BUDDY_CONTACT_URL}" target="_blank" rel="noopener noreferrer" style="color:var(--accent2);font-weight:600;text-decoration:underline;">Contact Study Buddy</a> on WhatsApp to start again.</div>`;
-  return shell(body, 'Study Buddy — Link Expired');
+    <div class="sub" style="text-align:center;margin-bottom:0;"><a href="${CONTACT_URL}" target="_blank" rel="noopener noreferrer" style="color:var(--accent2);font-weight:600;text-decoration:underline;">Contact RoughBOOK</a> on WhatsApp to start again.</div>`;
+  return shell(body, 'RoughBOOK — Link Expired');
 }
 
 function claimedPage(id) {
@@ -1059,5 +1149,5 @@ function claimedPage(id) {
         }
       })();
     </script>`;
-  return shell(body, 'Study Buddy — Reconnecting');
+  return shell(body, 'RoughBOOK — Reconnecting');
 }
