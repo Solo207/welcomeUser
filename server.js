@@ -68,6 +68,7 @@ async function sendFinalWebhook(record, status, reason) {
   const payload = {
     wa_id: record.wa_id,
     username: record.username,
+    userId: record.userId ?? null,
     phone: record.phone || null,
     school: record.school || null,
     department: record.department || null,
@@ -190,13 +191,15 @@ async function callWebhook(url, payload) {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// POST /create-signup  { wa_id, username, url } → { link, id }
+// POST /create-signup  { wa_id, username, url, userId } → { link, id }
+// `userId` is never shown on any page — it is stored and handed back in every webhook payload.
 // `url` is where the user is sent (same tab, immediately) once step 3 is complete.
 // If this wa_id already has an active (non-done) link, it's invalidated first — see
 // invalidateActiveByWaId — so at most one signup link can ever be "live" per wa_id.
 app.post('/create-signup', async (req, res) => {
-  const { wa_id, username, url } = req.body || {};
-  if (!wa_id || !username || !url) return res.status(400).json({ error: 'Missing wa_id, username or url' });
+  const { wa_id, username, url, userId } = req.body || {};
+  const hasUserId = (typeof userId === 'string' && userId.trim() !== '') || typeof userId === 'number';
+  if (!wa_id || !username || !url || !hasUserId) return res.status(400).json({ error: 'Missing wa_id, username, url or userId' });
   if (!isValidRedirectUrl(url)) return res.status(400).json({ error: 'url must be a valid http(s) URL' });
 
   const id      = uuidv4();
@@ -208,6 +211,7 @@ app.post('/create-signup', async (req, res) => {
     wa_id: waIdStr,
     username: String(username),
     redirectUrl: String(url).trim(),
+    userId: typeof userId === 'string' ? userId.trim() : userId, // hidden — only ever sent back out via webhooks
     createdAt: Date.now(),
     expiresAt: Date.now() + TTL_MS,
     claimed: false,
@@ -307,7 +311,7 @@ app.post('/signup/:id/phone', async (req, res) => {
   }
   const fullNumber = COUNTRY_CODE + digits;
 
-  const result = await callWebhook(SEND_CODE_URL, { wa_id: record.wa_id, username: record.username, phone: fullNumber });
+  const result = await callWebhook(SEND_CODE_URL, { wa_id: record.wa_id, username: record.username, userId: record.userId ?? null, phone: fullNumber });
   if (!result.reachable) return res.status(502).json({ ok: false, error: 'Could not reach the verification service. Please try again.' });
 
   // The webhook can respond with a plain-text body (e.g. "already exists") rather than
@@ -348,7 +352,7 @@ app.post('/signup/:id/resend', async (req, res) => {
     return res.json({ ok: false, locked: true, error: 'Too many resend attempts. Contact RoughBOOK on WhatsApp to start again.' });
   }
 
-  const result = await callWebhook(SEND_CODE_URL, { wa_id: record.wa_id, username: record.username, phone: record.phone });
+  const result = await callWebhook(SEND_CODE_URL, { wa_id: record.wa_id, username: record.username, userId: record.userId ?? null, phone: record.phone });
   if (!result.reachable || !result.httpOk || result.data?.ok === false || result.data?.error) {
     record.resendCount -= 1; // don't charge an attempt if it didn't actually go out
     saveStore(store);
@@ -370,7 +374,7 @@ app.post('/signup/:id/verify', async (req, res) => {
   const code = String(req.body?.code || '').trim();
   if (!isValidPin(code)) return res.status(400).json({ ok: false, error: `Please enter the ${PIN_LENGTH}-digit code.` });
 
-  const result = await callWebhook(VERIFY_CODE_URL, { code, wa_id: record.wa_id, phone: record.phone });
+  const result = await callWebhook(VERIFY_CODE_URL, { code, wa_id: record.wa_id, userId: record.userId ?? null, phone: record.phone });
   if (!result.reachable) return res.status(502).json({ ok: false, error: 'Could not reach the verification service. Please try again.' });
 
   if (Array.isArray(result.data)) {
@@ -435,6 +439,7 @@ app.post('/signup/:id/complete', async (req, res) => {
   const payload = {
     wa_id: record.wa_id,
     username: record.username,
+    userId: record.userId ?? null,
     phone: record.phone,
     school, department, level,
     agreed_terms: true,
@@ -545,14 +550,15 @@ const BASE_STYLE = `
   .pin-box{width:100%;aspect-ratio:1;text-align:center;font-family:var(--mono);font-size:1.3rem;font-weight:600;
     background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text);outline:none;transition:border-color .2s;}
   .pin-box:focus{border-color:var(--accent);}
-  .phone-row{display:flex;align-items:stretch;gap:4px;margin-bottom:6px;}
-  .phone-prefix{display:flex;align-items:center;justify-content:center;flex-shrink:0;padding:0 10px;margin-right:4px;border-radius:10px;
-    background:var(--surface);border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:.95rem;font-weight:600;user-select:none;cursor:default;}
-  .phone-box{flex:1 1 0;min-width:0;height:46px;padding:0;text-align:center;font-family:var(--mono);font-size:1rem;font-weight:600;
-    background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);outline:none;transition:border-color .2s;}
-  .phone-box:focus{border-color:var(--accent);}
-  .phone-box.grp{margin-right:4px;}
-  @media(max-width:380px){.phone-prefix{padding:0 7px;font-size:.82rem;margin-right:2px;}.phone-row{gap:3px;}}
+  .phone-field{display:flex;align-items:stretch;background:var(--surface2);border:1px solid var(--border);border-radius:10px;overflow:hidden;
+    cursor:text;margin-bottom:4px;transition:border-color .2s;}
+  .phone-field:focus-within{border-color:var(--accent);}
+  .phone-field.bad{border-color:var(--bad);}
+  .phone-prefix{display:flex;align-items:center;padding:0 12px 0 14px;border-right:1px solid var(--border);color:var(--muted);
+    font-family:var(--mono);font-size:1.05rem;font-weight:600;user-select:none;-webkit-user-select:none;cursor:default;}
+  .phone-field input{flex:1;min-width:0;width:auto;margin:0;padding:13px 14px;background:transparent;border:none;outline:none;color:var(--text);
+    font-family:var(--mono);font-size:1.05rem;font-weight:600;letter-spacing:.08em;}
+  .phone-field input::placeholder{color:var(--muted);opacity:.45;font-weight:400;}
   .checkbox-row{display:flex;align-items:flex-start;gap:10px;margin:18px 0 22px;}
   .checkbox-row input{width:18px;height:18px;margin-top:1px;accent-color:var(--accent);flex-shrink:0;}
   .checkbox-row label{margin:0;font-size:.82rem;color:var(--muted);line-height:1.5;}
@@ -634,11 +640,9 @@ function renderPage(id, record) {
 function phonePage(id, record) {
   const idJson        = safeJson(id);
   const identityLabel = `${record.username} • ${record.wa_id}`;
-  // Coming back from the pin page ("Wrong number?") re-fills the boxes so the user only
+  // Coming back from the pin page ("Wrong number?") re-fills the box so the user only
   // has to fix the typo.
   const prefill = record.phone ? String(record.phone).slice(COUNTRY_CODE.length) : '';
-  const boxes = Array.from({ length: PHONE_LENGTH }, (_, i) =>
-    `<input class="phone-box${i === 2 || i === 5 ? ' grp' : ''}" maxlength="1" inputmode="numeric" pattern="[0-9]*" autocomplete="off" aria-label="Digit ${i + 1} of ${PHONE_LENGTH}"/>`).join('');
   const body = `
     <div class="expiry-timer" id="expiryTimer"></div>
     <div class="eyebrow">RoughBOOK Registration</div>
@@ -651,10 +655,10 @@ function phonePage(id, record) {
     </div>
     <div class="banner bad" id="banner"></div>
     <div class="field">
-      <label>WhatsApp number</label>
-      <div class="phone-row">
-        <div class="phone-prefix" aria-label="Country code plus ${COUNTRY_CODE}">+${COUNTRY_CODE}</div>
-        ${boxes}
+      <label for="phone">WhatsApp number</label>
+      <div class="phone-field" id="phoneField">
+        <span class="phone-prefix">+${COUNTRY_CODE}</span>
+        <input id="phone" type="tel" inputmode="numeric" autocomplete="tel-national" placeholder="803 123 4567" aria-describedby="phoneErr"/>
       </div>
       <div class="err" id="phoneErr">Please enter all ${PHONE_LENGTH} digits (without the leading 0).</div>
     </div>
@@ -663,58 +667,62 @@ function phonePage(id, record) {
       const ID        = ${idJson};
       const PHONE_LEN = ${PHONE_LENGTH};
       const PREFILL   = ${safeJson(prefill)};
-      const boxesEls  = Array.from(document.querySelectorAll('.phone-box'));
+      const field     = document.getElementById('phoneField');
+      const phoneIn   = document.getElementById('phone');
       const phoneErr  = document.getElementById('phoneErr');
       const banner    = document.getElementById('banner');
       const btn       = document.getElementById('submitBtn');
 
-      function currentDigits() { return boxesEls.map(b => b.value).join(''); }
-      function isComplete() {
-        const d = currentDigits();
-        return d.length === PHONE_LEN && d.charAt(0) !== '0';
+      // Whatever is typed, pasted or autofilled (0803…, +234 803…, 234803…) → the digits
+      // that follow the fixed +234, capped at PHONE_LEN.
+      function normalize(raw) {
+        let d = String(raw || '').replace(/[^0-9]/g, '');
+        if (d.indexOf('234') === 0 && d.length > PHONE_LEN) d = d.slice(3); // country code came along
+        d = d.replace(/^0+/, '');                                            // +234 already stands in for the 0
+        return d.slice(0, PHONE_LEN);
       }
+      // '8031234567' → '803 123 4567'
+      function format(d) {
+        return d.slice(0, 3) + (d.length > 3 ? ' ' + d.slice(3, 6) : '') + (d.length > 6 ? ' ' + d.slice(6) : '');
+      }
+      function caretAfterDigit(formatted, n) {
+        if (n <= 0) return 0;
+        let seen = 0;
+        for (let i = 0; i < formatted.length; i++) {
+          if (/[0-9]/.test(formatted.charAt(i)) && ++seen === n) return i + 1;
+        }
+        return formatted.length;
+      }
+      function currentDigits() { return phoneIn.value.replace(/[^0-9]/g, ''); }
+      function isComplete() { return currentDigits().length === PHONE_LEN; }
       function validate(showError) {
         const ok = isComplete();
-        if (showError) phoneErr.classList.toggle('show', !ok);
-        else if (ok) phoneErr.classList.remove('show');
+        if (showError) { phoneErr.classList.toggle('show', !ok); field.classList.toggle('bad', !ok); }
+        else if (ok) { phoneErr.classList.remove('show'); field.classList.remove('bad'); }
         return ok;
       }
 
-      // Turns whatever was pasted (0803…, +234 803…, 234803…) into the 10 digits that
-      // follow the fixed +234.
-      function normalizePasted(raw) {
-        let d = String(raw || '').replace(/[^0-9]/g, '');
-        if (d.indexOf('234') === 0 && d.length > PHONE_LEN) d = d.slice(3);
-        d = d.replace(/^0+/, '');
-        return d.slice(0, PHONE_LEN);
-      }
-
-      boxesEls.forEach((el, i) => {
-        el.addEventListener('focus', () => el.select());
-        el.addEventListener('input', () => {
-          let v = el.value.replace(/[^0-9]/g, '');
-          if (i === 0 && v === '0') v = ''; // +234 already stands in for the leading 0
-          el.value = v.slice(0, 1);
-          if (el.value && i < boxesEls.length - 1) boxesEls[i + 1].focus();
-          validate(false);
-        });
-        el.addEventListener('keydown', (e) => {
-          if (e.key === 'Backspace' && !el.value && i > 0) { e.preventDefault(); boxesEls[i - 1].value = ''; boxesEls[i - 1].focus(); }
-          else if (e.key === 'ArrowLeft' && i > 0) { e.preventDefault(); boxesEls[i - 1].focus(); }
-          else if (e.key === 'ArrowRight' && i < boxesEls.length - 1) { e.preventDefault(); boxesEls[i + 1].focus(); }
-          else if (e.key === 'Enter') { btn.click(); }
-        });
-        el.addEventListener('paste', (e) => {
-          e.preventDefault();
-          const digits = normalizePasted((e.clipboardData || window.clipboardData).getData('text')).split('');
-          boxesEls.forEach((b, j) => { b.value = digits[j] || ''; });
-          boxesEls[Math.min(digits.length, boxesEls.length - 1)].focus();
-          validate(false);
-        });
+      phoneIn.addEventListener('input', () => {
+        const raw        = phoneIn.value;
+        const rawDigits  = raw.replace(/[^0-9]/g, '');
+        const caret      = phoneIn.selectionStart == null ? raw.length : phoneIn.selectionStart;
+        const digitsLeft = raw.slice(0, caret).replace(/[^0-9]/g, '').length;
+        const digits     = normalize(raw);
+        const formatted  = format(digits);
+        phoneIn.value = formatted;
+        // Keep the caret where the user was typing; if digits were stripped or cut off
+        // (leading 0 / +234 / too long) just park it at the end.
+        const pos = digits === rawDigits ? caretAfterDigit(formatted, digitsLeft) : formatted.length;
+        try { phoneIn.setSelectionRange(pos, pos); } catch (e) {}
+        validate(false);
       });
+      phoneIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') btn.click(); });
+      // Tapping the +234 chip or the padding around the box still puts the cursor in it.
+      field.addEventListener('mousedown', (e) => { if (e.target !== phoneIn) { e.preventDefault(); phoneIn.focus(); } });
 
-      PREFILL.split('').forEach((c, j) => { if (boxesEls[j]) boxesEls[j].value = c; });
-      boxesEls[Math.min(PREFILL.length, PHONE_LEN - 1)].focus();
+      if (PREFILL) phoneIn.value = format(normalize(PREFILL));
+      phoneIn.focus();
+      phoneIn.setSelectionRange(phoneIn.value.length, phoneIn.value.length);
 
       // If a submit fails purely due to a dropped connection (not a real error response),
       // wait for the browser to report it's back online (or 8s, whichever first) and retry
@@ -757,7 +765,7 @@ function phonePage(id, record) {
 
       btn.addEventListener('click', () => {
         banner.classList.remove('show');
-        if (!validate(true)) { (boxesEls.find(b => !b.value) || boxesEls[0]).focus(); return; }
+        if (!validate(true)) { phoneIn.focus(); return; }
         attemptSendPhone();
       });
     </script>`;
