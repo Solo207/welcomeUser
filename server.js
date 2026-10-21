@@ -710,9 +710,12 @@ function phonePage(id, record) {
         const digits     = normalize(raw);
         const formatted  = format(digits);
         phoneIn.value = formatted;
-        // Keep the caret where the user was typing; if digits were stripped or cut off
-        // (leading 0 / +234 / too long) just park it at the end.
-        const pos = digits === rawDigits ? caretAfterDigit(formatted, digitsLeft) : formatted.length;
+        // Keep the caret where the user was typing. Cutting digits off the END (number
+        // already full) doesn't move anything before the caret; only a stripped leading
+        // 0 / +234 shifts positions, in which case park the caret at the end.
+        const pos = rawDigits.indexOf(digits) === 0
+          ? caretAfterDigit(formatted, Math.min(digitsLeft, digits.length))
+          : formatted.length;
         try { phoneIn.setSelectionRange(pos, pos); } catch (e) {}
         validate(false);
       });
