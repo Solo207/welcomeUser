@@ -36,6 +36,8 @@ const SEND_CODE_URL    = 'https://sb-n8n.rhat7s.easypanel.host/webhook/getEmail'
 const VERIFY_CODE_URL  = 'https://sb-n8n.rhat7s.easypanel.host/webhook/verifyEmail';
 const TERMS_URL        = 'https://sb-n8n.rhat7s.easypanel.host/webhook/termsAndConditions';
 const FINAL_URL        = 'https://sb-n8n.rhat7s.easypanel.host/webhook/final';
+const CLOSED_FILE   = path.join(__dirname, 'closed-links.json');
+const CLOSED_TTL_MS = 7 * 24 * 60 * 60 * 1000; // how long a dead link remembers its return url
 
 // ── Atomic write queue (avoids race conditions / file corruption) ─────────────
 let storeWriteQueue = Promise.resolve();
@@ -54,6 +56,42 @@ function saveStore(store) {
   }).catch(err => console.error('saveStore error:', err));
 }
 
+// Remembers id → redirectUrl for links that were removed (expired, locked out, done), so
+// the "link expired" page can still send the user back to the url from /create-signup.
+// Kept in memory as the source of truth so several removals in the same tick can't
+// overwrite each other.
+let closedCache = null;
+let closedWriteQueue = Promise.resolve();
+
+function getClosed() {
+  if (!closedCache) {
+    try { closedCache = fs.existsSync(CLOSED_FILE) ? JSON.parse(fs.readFileSync(CLOSED_FILE, 'utf8')) : {}; }
+    catch (e) { console.error('getClosed error:', e); closedCache = {}; }
+  }
+  return closedCache;
+}
+
+function persistClosed() {
+  closedWriteQueue = closedWriteQueue.then(() => {
+    const tmp = CLOSED_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(closedCache), 'utf8');
+    fs.renameSync(tmp, CLOSED_FILE);
+  }).catch(err => console.error('persistClosed error:', err));
+}
+
+// Use this instead of `delete store[id]` everywhere.
+function closeRecord(store, id) {
+  const record = store[id];
+  if (record) {
+    const closed = getClosed();
+    const now = Date.now();
+    closed[id] = { redirectUrl: record.redirectUrl || null, closedAt: now };
+    Object.keys(closed).forEach(k => { if (now - closed[k].closedAt > CLOSED_TTL_MS) delete closed[k]; });
+    persistClosed();
+  }
+  delete store[id];
+}
+
 function isExpired(record) {
   return Date.now() > record.expiresAt;
 }
@@ -63,7 +101,7 @@ function isExpired(record) {
 // if the flow never got that far) plus a status field, and a reason code on failure so
 // your n8n workflow can tell WHY it failed.
 // Reason codes: 'link_expired' | 'max_pin_attempts' | 'max_phone_changes' |
-//               'max_resend_attempts' | 'superseded_by_new_link'
+//               'max_resend_attempts'
 async function sendFinalWebhook(record, status, reason) {
   const payload = {
     wa_id: record.wa_id,
@@ -101,29 +139,17 @@ async function cleanup(store) {
     }
   }));
 
-  expiredIds.forEach(id => delete store[id]);
+  expiredIds.forEach(id => closeRecord(store, id));
   saveStore(store);
   return store;
 }
 
 // Enforces "one active link per wa_id": before a new signup link is minted, any other
 // record already sitting in the store for this same wa_id that hasn't reached 'done'
-// gets killed off first — its final webhook fires with reason 'superseded_by_new_link',
+// gets killed off first — its final webhook fires with reason 
 // then it's deleted. This means the moment a fresh link is issued, every older link for
 // that wa_id 404s (GET /signup/:id no longer finds the record) even if it was mid-flow.
 // 'done' records are left alone since they already completed and sent a success call.
-async function invalidateActiveByWaId(store, waId) {
-  const staleIds = Object.keys(store).filter(id => store[id].wa_id === waId && store[id].stage !== 'done');
-  if (!staleIds.length) return;
-
-  await Promise.all(staleIds.map(async id => {
-    try { await sendFinalWebhook(store[id], 'failed', 'superseded_by_new_link'); }
-    catch (e) { console.error('Supersede webhook failed:', e); }
-  }));
-
-  staleIds.forEach(id => delete store[id]);
-  saveStore(store);
-}
 
 setInterval(async () => {
   const store = loadStore();
@@ -192,43 +218,55 @@ async function callWebhook(url, payload) {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // POST /create-signup  { wa_id, username, url, userId } → { link, id }
-// `userId` is never shown on any page — it is stored and handed back in every webhook payload.
-// `url` is where the user is sent (same tab, immediately) once step 3 is complete.
-// If this wa_id already has an active (non-done) link, it's invalidated first — see
-// invalidateActiveByWaId — so at most one signup link can ever be "live" per wa_id.
+// If this wa_id already has a link that is neither finished ('done') nor expired, that
+// same link is returned instead of minting a new one. Its expiry is NOT extended, and
+// its return url is refreshed to the one in this request.
 app.post('/create-signup', async (req, res) => {
   const { wa_id, username, url, userId } = req.body || {};
   const hasUserId = (typeof userId === 'string' && userId.trim() !== '') || typeof userId === 'number';
   if (!wa_id || !username || !url || !hasUserId) return res.status(400).json({ error: 'Missing wa_id, username, url or userId' });
   if (!isValidRedirectUrl(url)) return res.status(400).json({ error: 'url must be a valid http(s) URL' });
 
-  const id      = uuidv4();
-  const waIdStr = String(wa_id);
-  const store   = await cleanup(loadStore());
-  await invalidateActiveByWaId(store, waIdStr);
+  const waIdStr  = String(wa_id);
+  const store    = await cleanup(loadStore());
+  const host     = req.headers['x-forwarded-host'] || req.headers.host;
+  const protocol = req.headers['x-forwarded-proto'] || 'http';
+  const linkFor  = id => `${protocol}://${host}/signup/${id}`;
 
+  // Reuse the newest still-live link for this wa_id, if any.
+  const existingId = Object.keys(store)
+    .filter(id => store[id].wa_id === waIdStr && store[id].stage !== 'done' && !isExpired(store[id]))
+    .sort((a, b) => store[b].createdAt - store[a].createdAt)[0];
+
+  if (existingId) {
+    const existing = store[existingId];
+    existing.redirectUrl = String(url).trim();
+    saveStore(store);
+    const minsLeft = Math.max(1, Math.ceil((existing.expiresAt - Date.now()) / 60000));
+    return res.json({ link: linkFor(existingId), id: existingId, expiresIn: `${minsLeft} minutes`, reused: true });
+  }
+
+  const id = uuidv4();
   store[id] = {
     wa_id: waIdStr,
     username: String(username),
     redirectUrl: String(url).trim(),
-    userId: typeof userId === 'string' ? userId.trim() : userId, // hidden — only ever sent back out via webhooks
+    userId: typeof userId === 'string' ? userId.trim() : userId,
     createdAt: Date.now(),
     expiresAt: Date.now() + TTL_MS,
     claimed: false,
     sessionToken: null,
-    stage: 'phone',            // phone → pin → details → done
-    phone: null,               // full number incl. country code, e.g. 2348031234567
+    stage: 'phone',
+    phone: null,
     academicOptions: null,
     attempts: 0,
     phoneChanges: 0,
     resendCount: 0,
-    lastCodeSentAt: null       // set whenever a code actually goes out — drives the resend cooldown
+    lastCodeSentAt: null
   };
   saveStore(store);
 
-  const host     = req.headers['x-forwarded-host'] || req.headers.host;
-  const protocol = req.headers['x-forwarded-proto'] || 'http';
-  res.json({ link: `${protocol}://${host}/signup/${id}`, id, expiresIn: '2 hours' });
+  res.json({ link: linkFor(id), id, expiresIn: '2 hours', reused: false });
 });
 
 // GET /signup/:id — serves whichever stage the record is actually on server-side.
@@ -238,7 +276,7 @@ app.post('/create-signup', async (req, res) => {
 app.get('/signup/:id', async (req, res) => {
   const store  = await cleanup(loadStore());
   const record = store[req.params.id];
-  if (!record) return res.status(404).send(expiredPage());
+  if (!record) return res.status(404).send(expiredPage(getClosed()[req.params.id]?.redirectUrl));
 
   const cookieName    = 'ssess_' + req.params.id;
   const sessionCookie = req.cookies?.[cookieName];
@@ -284,7 +322,7 @@ async function loadGuardedRecord(req, res, expectedStage) {
 
   if (isExpired(record)) {
     await sendFinalWebhook(record, 'failed', 'link_expired');
-    delete store[req.params.id];
+    closeRecord(store, req.params.id);
     saveStore(store);
     res.status(410).json({ ok: false, locked: true, error: 'This link has expired. Contact RoughBOOK on WhatsApp to start again.' });
     return null;
@@ -347,7 +385,7 @@ app.post('/signup/:id/resend', async (req, res) => {
   record.resendCount = (record.resendCount || 0) + 1;
   if (record.resendCount > MAX_RESEND) {
     await sendFinalWebhook(record, 'failed', 'max_resend_attempts');
-    delete store[req.params.id];
+    closeRecord(store, req.params.id);
     saveStore(store);
     return res.json({ ok: false, locked: true, error: 'Too many resend attempts. Contact RoughBOOK on WhatsApp to start again.' });
   }
@@ -391,7 +429,7 @@ app.post('/signup/:id/verify', async (req, res) => {
   record.attempts = (record.attempts || 0) + 1;
   if (record.attempts >= MAX_PIN_ATTEMPTS) {
     await sendFinalWebhook(record, 'failed', 'max_pin_attempts');
-    delete store[req.params.id];
+    closeRecord(store, req.params.id);
     saveStore(store);
     return res.json({ ok: false, locked: true, error: 'Too many incorrect attempts. Contact RoughBOOK on WhatsApp to start again.' });
   }
@@ -412,7 +450,7 @@ app.post('/signup/:id/back-to-phone', async (req, res) => {
   record.phoneChanges = (record.phoneChanges || 0) + 1;
   if (record.phoneChanges > MAX_PHONE_CHANGES) {
     await sendFinalWebhook(record, 'failed', 'max_phone_changes');
-    delete store[req.params.id];
+    closeRecord(store, req.params.id);
     saveStore(store);
     return res.json({ ok: false, locked: true, error: 'Too many number changes. Contact RoughBOOK on WhatsApp to start again.' });
   }
@@ -633,7 +671,7 @@ function renderPage(id, record) {
   if (record.stage === 'pin')     return pinPage(id, record);
   if (record.stage === 'details') return detailsPage(id, record);
   if (record.stage === 'done')    return donePage(id, record);
-  return expiredPage();
+  return expiredPage(record.redirectUrl);
 }
 
 // ── Stage 1: phone ────────────────────────────────────────────────────────────
@@ -1121,12 +1159,13 @@ function donePage(id, record) {
 }
 
 // ── Expired / recovery pages ──────────────────────────────────────────────────
-function expiredPage() {
+function expiredPage(redirectUrl) {
+  const url = redirectUrl || CONTACT_URL; // fallback for unknown / very old links
   const body = `
     <div class="center-icon">⏳</div>
     <h1 style="text-align:center;">Link expired</h1>
-    <div class="sub" style="text-align:center;">This signup link is no longer valid — it may have expired, been used too many times, been replaced by a newer link, or already been completed.</div>
-    <div class="sub" style="text-align:center;margin-bottom:0;"><a href="${CONTACT_URL}" target="_blank" rel="noopener noreferrer" style="color:var(--accent2);font-weight:600;text-decoration:underline;">Contact RoughBOOK</a> on WhatsApp to start again.</div>`;
+    <div class="sub" style="text-align:center;">This signup link is no longer valid — it may have expired, been used too many times, or already been completed.</div>
+    <div class="sub" style="text-align:center;margin-bottom:0;"><a href="${escapeHtml(url)}" style="color:var(--accent2);font-weight:600;text-decoration:underline;">Tap here</a> to go back and start again.</div>`;
   return shell(body, 'RoughBOOK — Link Expired');
 }
 
